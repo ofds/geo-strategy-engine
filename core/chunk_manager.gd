@@ -12,14 +12,27 @@ var loading_screen = null
 # Loaded chunks: Key = "lod{L}_x{X}_y{Y}", Value = {node: Node3D, lod: int, x: int, y: int}
 var loaded_chunks: Dictionary = {}
 
+# Load queue: chunks to load one per frame (array of {lod, x, y}), sorted by distance closest first
+var load_queue: Array = []
+
+# Async: task_id -> { chunk_key, lod, x, y, args }. Max 4 concurrent Phase A tasks.
+var pending_loads: Dictionary = {}
+const MAX_CONCURRENT_ASYNC_LOADS: int = 4
+# Chunks currently loading (key -> true) so we don't re-queue them
+var loading_chunk_keys: Dictionary = {}
+# Desired set from last _update_chunks; used to discard completed loads that are no longer wanted
+var last_desired: Dictionary = {}
+
 # Update timer and adaptive frequency
 var update_timer: float = 0.0
 const UPDATE_INTERVAL_IDLE: float = 0.5
 const UPDATE_INTERVAL_LOADING: float = 0.25
 var current_update_interval: float = 0.5
 
-# Initial load flag
+# Initial load: when true, we're still loading the first desired set (async from queue)
 var initial_load_complete: bool = false
+var initial_load_in_progress: bool = false
+var initial_desired: Dictionary = {}  # desired set at startup; used for progress and "still wanted"
 
 # Constants
 const LOD_DISTANCES_M: Array[float] = [0.0, 25000.0, 50000.0, 100000.0, 200000.0]
@@ -40,6 +53,9 @@ var lod_hysteresis_state: Dictionary = {}
 
 # Deferred unload tracking: Key = chunk_key, Value = timestamp when deferred
 var deferred_unload_times: Dictionary = {}
+
+# Set true in Inspector (or here) to print [TIME] streaming phase timings
+@export var DEBUG_STREAMING_TIMING: bool = false
 
 # DIAGNOSTIC: Camera position tracking for stability detection
 var diagnostic_last_camera_pos: Vector3 = Vector3.ZERO
@@ -82,20 +98,17 @@ func _ready() -> void:
 	if loading_screen:
 		await get_tree().process_frame
 	
-	print("\n=== ChunkManager: Initial Load ===")
-	await _initial_load()
-	
-	initial_load_complete = true
-	print("=== Initial load complete: %d chunks, FPS: %d ===" % [loaded_chunks.size(), Engine.get_frames_per_second()])
-	
-	if loading_screen:
-		loading_screen.hide_loading()
-	
-	await get_tree().create_timer(5.0).timeout
-	print("Dynamic chunk streaming active")
+	print("\n=== ChunkManager: Initial Load (async) ===")
+	_initial_load()
+	# initial_load_complete set in _process when initial_desired is fully loaded
 
 
 func _process(delta: float) -> void:
+	# During initial load: only drive async load and progress; no streaming yet
+	if initial_load_in_progress:
+		_process_initial_load()
+		return
+	
 	if not initial_load_complete:
 		return
 	
@@ -106,6 +119,97 @@ func _process(delta: float) -> void:
 	if update_timer >= current_update_interval:
 		update_timer = 0.0
 		_update_chunks()
+	
+	_process_async_load_one()
+	return
+
+
+## Run during initial load: complete all ready Phase B, submit up to cap from queue, update progress, detect done.
+func _process_initial_load() -> void:
+	var want_count = initial_desired.size()
+	# Complete every ready Phase B this frame (no per-frame cap during initial load so it finishes fast)
+	var completed_ids: Array = []
+	for tid in pending_loads.keys():
+		if WorkerThreadPool.is_task_completed(tid):
+			completed_ids.append(tid)
+	for tid in completed_ids:
+		var entry = pending_loads[tid]
+		pending_loads.erase(tid)
+		var chunk_key: String = entry.chunk_key
+		loading_chunk_keys.erase(chunk_key)
+		WorkerThreadPool.wait_for_task_completion(tid)
+		var computed = entry.args["result"]
+		if not computed.is_empty() and initial_desired.has(chunk_key):
+			var path_for_cache: String = computed.get("path_for_cache", "")
+			var heights_for_cache = computed.get("heights_for_cache", [])
+			if path_for_cache != "" and heights_for_cache.size() > 0:
+				terrain_loader._add_to_height_cache(path_for_cache, heights_for_cache)
+			var chunk_node = terrain_loader.finish_load(computed, collision_body, false)
+			if chunk_node:
+				chunks_container.add_child(chunk_node)
+				loaded_chunks[chunk_key] = {"node": chunk_node, "lod": entry.lod, "x": entry.x, "y": entry.y}
+				if loading_screen:
+					loading_screen.update_progress(loaded_chunks.size(), want_count, chunk_key)
+	# Submit up to cap so we keep 4 tasks in flight
+	while load_queue.size() > 0 and pending_loads.size() < MAX_CONCURRENT_ASYNC_LOADS:
+		var info = load_queue.pop_front()
+		var key = "lod%d_x%d_y%d" % [info.lod, info.x, info.y]
+		if loaded_chunks.has(key) or loading_chunk_keys.has(key):
+			continue
+		loading_chunk_keys[key] = true
+		var async_result = terrain_loader.start_async_load(info.x, info.y, info.lod)
+		var task_id: int = async_result["task_id"]
+		var args: Dictionary = async_result["args"]
+		pending_loads[task_id] = {"chunk_key": key, "lod": info.lod, "x": info.x, "y": info.y, "args": args}
+	# Done when we have every chunk from initial_desired
+	var have_all = true
+	for key in initial_desired.keys():
+		if not loaded_chunks.has(key):
+			have_all = false
+			break
+	if have_all:
+		initial_load_in_progress = false
+		initial_load_complete = true
+		if loading_screen:
+			loading_screen.hide_loading()
+		print("=== Initial load complete: %d chunks, FPS: %d ===" % [loaded_chunks.size(), Engine.get_frames_per_second()])
+		get_tree().create_timer(5.0).timeout.connect(_on_initial_load_delay_done)
+
+
+## Complete one Phase B and optionally submit one new async load (streaming path).
+func _process_async_load_one() -> void:
+	var completed_task_id = -1
+	for tid in pending_loads.keys():
+		if WorkerThreadPool.is_task_completed(tid):
+			completed_task_id = tid
+			break
+	if completed_task_id >= 0:
+		var entry = pending_loads[completed_task_id]
+		pending_loads.erase(completed_task_id)
+		var chunk_key: String = entry.chunk_key
+		loading_chunk_keys.erase(chunk_key)
+		WorkerThreadPool.wait_for_task_completion(completed_task_id)
+		var computed = entry.args["result"]
+		if not computed.is_empty() and last_desired.has(chunk_key):
+			var path_for_cache: String = computed.get("path_for_cache", "")
+			var heights_for_cache = computed.get("heights_for_cache", [])
+			if path_for_cache != "" and heights_for_cache.size() > 0:
+				terrain_loader._add_to_height_cache(path_for_cache, heights_for_cache)
+			var chunk_node = terrain_loader.finish_load(computed, collision_body, false)
+			if chunk_node:
+				chunks_container.add_child(chunk_node)
+				loaded_chunks[chunk_key] = {"node": chunk_node, "lod": entry.lod, "x": entry.x, "y": entry.y}
+				print("[Stream] Loaded %s" % chunk_key)
+	if load_queue.size() > 0 and pending_loads.size() < MAX_CONCURRENT_ASYNC_LOADS:
+		var info = load_queue.pop_front()
+		var key = "lod%d_x%d_y%d" % [info.lod, info.x, info.y]
+		if not loaded_chunks.has(key) and not loading_chunk_keys.has(key):
+			loading_chunk_keys[key] = true
+			var async_result = terrain_loader.start_async_load(info.x, info.y, info.lod)
+			var task_id: int = async_result["task_id"]
+			var args: Dictionary = async_result["args"]
+			pending_loads[task_id] = {"chunk_key": key, "lod": info.lod, "x": info.x, "y": info.y, "args": args}
+			print("[LOAD] Loading lod%d_x%d_y%d (queue: %d remaining)" % [info.lod, info.x, info.y, load_queue.size()])
 
 
 func _debug_dump_state() -> void:
@@ -125,25 +229,39 @@ func _debug_dump_state() -> void:
 	print("===========================\n")
 
 
+func _on_initial_load_delay_done() -> void:
+	print("Dynamic chunk streaming active")
+
+
 func _initial_load() -> void:
 	var camera_pos = _get_camera_ground_position()
 	var desired = _determine_desired_chunks(camera_pos)
+	initial_desired = desired
+	last_desired = desired
 	
-	print("Loading %d chunks synchronously..." % desired.size())
-	
-	var count = 0
+	# Queue all desired chunks (sorted by distance) for async load
+	load_queue.clear()
 	for key in desired.keys():
 		var info = desired[key]
-		_load_chunk(info.lod, info.x, info.y)
-		count += 1
-		if loading_screen and count % 5 == 0:
-			loading_screen.update_progress(count, desired.size(), key)
-			await get_tree().process_frame
+		load_queue.append({"lod": info.lod, "x": info.x, "y": info.y})
+	load_queue.sort_custom(func(a, b):
+		var center_a = _get_chunk_center_world(a.x, a.y, a.lod)
+		var center_b = _get_chunk_center_world(b.x, b.y, b.lod)
+		var dist_a = Vector2(center_a.x - camera_pos.x, center_a.z - camera_pos.z).length()
+		var dist_b = Vector2(center_b.x - camera_pos.x, center_b.z - camera_pos.z).length()
+		return dist_a < dist_b
+	)
+	
+	initial_load_in_progress = true
+	print("Loading %d chunks (async)..." % desired.size())
 
 
 func _update_chunks() -> void:
+	var cycle_t0 = Time.get_ticks_msec()
 	var camera_pos = _get_camera_ground_position()
+	var t_desired = Time.get_ticks_msec()
 	var desired = _determine_desired_chunks(camera_pos)
+	var time_desired_ms = Time.get_ticks_msec() - t_desired
 	
 	# DIAGNOSTIC: Track camera position changes to detect drift
 	var camera_moved = false
@@ -267,8 +385,10 @@ func _update_chunks() -> void:
 				print("  [CRITICAL] Unloading LOD 0 chunk: %s, reason: %s, distance: %.1fm" % [key, unload_reason, dist_to_camera])
 	
 	# Unload approved chunks
+	var t_unload: int = Time.get_ticks_msec()
 	for key in to_unload:
 		_unload_chunk(key)
+	var time_unload_ms = Time.get_ticks_msec() - t_unload
 	
 	# Sort to_load by distance from camera (closest first)
 	to_load.sort_custom(func(a, b):
@@ -279,22 +399,52 @@ func _update_chunks() -> void:
 		return dist_a < dist_b
 	)
 	
-	# Load up to MAX_LOADS_PER_UPDATE closest chunks
-	var loaded_count = 0
-	for i in range(min(MAX_LOADS_PER_UPDATE, to_load.size())):
-		_load_chunk(to_load[i].lod, to_load[i].x, to_load[i].y)
-		loaded_count += 1
+	# Store desired for "still wanted" check when async load completes
+	last_desired = desired
+	
+	# Queue chunks for loading (one per frame in _process); do not load here
+	for i in range(to_load.size()):
+		var info = to_load[i]
+		var key = "lod%d_x%d_y%d" % [info.lod, info.x, info.y]
+		if loaded_chunks.has(key) or loading_chunk_keys.has(key):
+			continue
+		var already_queued = false
+		for j in range(load_queue.size()):
+			var q = load_queue[j]
+			if q.lod == info.lod and q.x == info.x and q.y == info.y:
+				already_queued = true
+				break
+		if not already_queued:
+			load_queue.append({"lod": info.lod, "x": info.x, "y": info.y})
+	# Keep queue sorted by distance (closest first)
+	load_queue.sort_custom(func(a, b):
+		var center_a = _get_chunk_center_world(a.x, a.y, a.lod)
+		var center_b = _get_chunk_center_world(b.x, b.y, b.lod)
+		var dist_a = Vector2(center_a.x - camera_pos.x, center_a.z - camera_pos.z).length()
+		var dist_b = Vector2(center_b.x - camera_pos.x, center_b.z - camera_pos.z).length()
+		return dist_a < dist_b
+	)
+	
+	# Diff computation time (from after desired to start of unload)
+	var time_diff_ms = max(0.0, float(t_unload - t_desired) - time_desired_ms)
+	var total_cycle_ms = Time.get_ticks_msec() - cycle_t0
+	if DEBUG_STREAMING_TIMING:
+		print("[TIME] Desired set calculation: %dms" % int(time_desired_ms))
+		print("[TIME] Diff computation: %dms" % int(time_diff_ms))
+		print("[TIME] Unload phase: %dms (%d chunks)" % [int(time_unload_ms), to_unload.size()])
+		print("[TIME] Load phase: queued (1 per frame), %d in queue" % load_queue.size())
+		print("[TIME] Total update cycle: %dms" % int(total_cycle_ms))
 	
 	# Adjust update frequency based on load queue
-	if to_load.size() > 0:
+	if load_queue.size() > 0:
 		current_update_interval = UPDATE_INTERVAL_LOADING
 	else:
 		current_update_interval = UPDATE_INTERVAL_IDLE
 	
 	# Log update
-	if to_load.size() > 0 or to_unload.size() > 0:
-		print("[Stream] Update: loaded=%d, +%d loaded, -%d unloaded, %d pending, interval=%.2fs" %
-			[loaded_chunks.size(), loaded_count, to_unload.size(), to_load.size() - loaded_count, current_update_interval])
+	if load_queue.size() > 0 or to_unload.size() > 0:
+		print("[Stream] Update: loaded=%d, -%d unloaded, %d in queue, interval=%.2fs" %
+			[loaded_chunks.size(), to_unload.size(), load_queue.size(), current_update_interval])
 	
 	# Update Visibility (LOD Occlusion)
 	_update_chunk_visibility()

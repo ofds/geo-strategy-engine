@@ -2,3 +2,8 @@
 .godot/
 /android/
 data/
+
+# Profiling run output (optional)
+profiling_run.txt
+profiling_run_err.txt
+profiling_run_combined.txt

@@ -143,13 +143,14 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 		
 		# Toggle selection
 		if _selected_hex_center.distance_to(center) < 1.0:
-			# Deselect if clicking same hex
+			# Deselect if clicking same hex (instant, no fade-out)
 			print("DEBUG: Deselecting")
 			_selected_hex_center = Vector2(999999, 999999)
 		else:
-			# Select new hex
+			# Select new hex — reset animation timer
 			print("DEBUG: Selecting new hex")
 			_selected_hex_center = center
+			_selection_time = 0.0
 	else:
 		# Clicked sky/nothing -> Deselect
 		print("DEBUG: Clicked Sky -> Deselecting")
@@ -195,6 +196,7 @@ func _update_debug_visuals(hit_pos: Vector3, center_pos: Vector3) -> void:
 
 
 var _selected_hex_center: Vector2 = Vector2(999999, 999999)
+var _selection_time: float = 0.0 # Seconds since selection; animates lift/border/tint
 
 func _update_hex_selection_uniform() -> void:
 	# ... existing code ...
@@ -219,8 +221,8 @@ func _update_hex_selection_uniform() -> void:
 					terrain_material = mat
 	
 	if terrain_material:
-		print("DEBUG: Setting 'selected_hex_center' uniform to ", _selected_hex_center)
 		terrain_material.set_shader_parameter("selected_hex_center", _selected_hex_center)
+		terrain_material.set_shader_parameter("selection_time", _selection_time)
 	else:
 		print("DEBUG: Could not find terrain material to update selection!")
 
@@ -228,6 +230,10 @@ func _update_hex_selection_uniform() -> void:
 func _process(delta: float) -> void:
 	# Check for speed boost (Space key)
 	is_speed_boost_active = Input.is_key_pressed(KEY_SPACE)
+	
+	# Animate selection (lift/border/tint fade-in)
+	if _selected_hex_center.x < 900000.0: # Has selection (not sentinel)
+		_selection_time += delta
 	
 	# Smoothly interpolate orbit_distance toward target
 	orbit_distance = lerp(orbit_distance, target_orbit_distance, zoom_smoothing * delta)
@@ -400,6 +406,9 @@ func _update_hex_grid_interaction() -> void:
 		terrain_material.set_shader_parameter("altitude", position.y)
 		# Fog: pass camera position to shader
 		terrain_material.set_shader_parameter("camera_position", position)
+		# Selection animation time (incremented in _process when selected)
+		terrain_material.set_shader_parameter("selection_time", _selection_time)
+		terrain_material.set_shader_parameter("selected_hex_center", _selected_hex_center)
 		
 		# Update Hovered Hex
 		var mouse_pos = get_viewport().get_mouse_position()

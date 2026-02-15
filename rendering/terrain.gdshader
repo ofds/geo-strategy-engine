@@ -11,7 +11,7 @@ uniform float rim_tint : hint_range(0.0, 1.0) = 0.5;
 
 // Hex Grid
 uniform vec4 grid_color : source_color = vec4(0.0, 0.0, 0.0, 0.5);
-uniform vec4 highlight_color : source_color = vec4(1.0, 1.0, 1.0, 0.3); // White, 30% opacity
+uniform vec4 highlight_color : source_color = vec4(1.0, 1.0, 1.0, 0.08); // Hover: white, 8% opacity
 uniform float hex_size = 1000.0;
 uniform float line_width = 30.0;
 uniform bool show_grid = true;
@@ -19,6 +19,7 @@ uniform bool show_grid = true;
 // Interaction
 uniform vec2 hovered_hex_center = vec2(0.0, 0.0);
 uniform vec2 selected_hex_center = vec2(999999.0, 999999.0);
+uniform float selection_time = 0.0; // Seconds since selection; animates lift/border/tint
 uniform float altitude = 1000.0;
 
 // Fade
@@ -31,6 +32,7 @@ uniform vec3 camera_position = vec3(0.0, 0.0, 0.0);
 // --- Varyings ---
 varying vec3 v_world_pos;
 varying float v_is_selected; // 1.0 if inside selection
+varying float v_selection_time; // Pass-through for fragment animation
 varying vec3 v_view_dir; // For rim lighting calculation in fragment
 varying float v_elevation;
 varying vec3 v_world_normal;
@@ -117,105 +119,131 @@ vec3 terrain_height_color(float elev) {
 void vertex() {
     // 1. Calculate World Position (before selection lift - for elevation coloring)
     vec4 world_pos = MODEL_MATRIX * vec4(VERTEX, 1.0);
+    vec2 world_xz = world_pos.xz;
     v_world_pos = world_pos.xyz;
     v_elevation = world_pos.y;
     v_world_normal = (MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz;
-    
-    // 2. Determine Selection
-    v_is_selected = 0.0;
-    
-    vec2 pos_axial = world_to_axial(v_world_pos.xz, hex_size);
-    vec2 pos_center_axial = axial_round(pos_axial);
-    vec2 sel_center_axial = axial_round(world_to_axial(selected_hex_center, hex_size));
-    
-    // Check if this vertex belongs to the selected hex
-    if (abs(pos_center_axial.x - sel_center_axial.x) < 0.1 && abs(pos_center_axial.y - sel_center_axial.y) < 0.1) {
-        v_is_selected = 1.0;
-        
-        // --- ABDUCTION EFFECT ---
-        // Lift the vertex using a sine wave animation or smooth curve
-        // For now, simple lift
-        VERTEX.y += 300.0; // Raise 300m
-        
-        // Optional: Add some noise to the lift based on position to make it look like tearing?
-        // VERTEX.y += sin(VERTEX.x * 0.05) * 20.0;
+    v_selection_time = selection_time;
+
+    // 2. Hex membership: discrete — vertex is either inside selected hex or not
+    vec2 pos_axial = world_to_axial(world_xz, hex_size);
+    vec2 pos_rounded = axial_round(pos_axial);
+    vec2 sel_axial = world_to_axial(selected_hex_center, hex_size);
+    vec2 sel_rounded = axial_round(sel_axial);
+
+    const float EPS = 0.01;
+    bool in_selected = (abs(pos_rounded.x - sel_rounded.x) < EPS && abs(pos_rounded.y - sel_rounded.y) < EPS);
+    v_is_selected = in_selected ? 1.0 : 0.0;
+
+    if (in_selected) {
+        // Flat plateau: full 60m in interior, steep ramp in outer 10% of radius
+        vec2 center_world = axial_to_world(sel_rounded, hex_size);
+        float dist_to_center = distance(world_xz, center_world);
+        float hex_radius = hex_size * 0.5; // apothem (center to flat edge)
+        float plateau = 60.0 * smoothstep(hex_radius * 0.9, hex_radius, dist_to_center);
+        // Animate lift over 0.25s with ease-out (decelerating rise)
+        float lift_raw = min(selection_time / 0.25, 1.0);
+        float lift_fade = 1.0 - pow(1.0 - lift_raw, 3.0);
+        VERTEX.y += plateau * lift_fade;
+        // Subtle floating oscillation (±2m at 1.5Hz)
+        VERTEX.y += 2.0 * sin(TIME * 1.5) * lift_fade;
     }
+    // Else: zero displacement — neighbors never move
 }
 
 void fragment() {
     // 1. Base terrain color from elevation and slope
     vec3 n = normalize(v_world_normal);
-    float slope = 1.0 - n.y; // 0 = flat, 1 = vertical
     vec3 height_col = terrain_height_color(v_elevation);
     vec3 steep_col = COLOR_STEEP_ROCK;
-    // Steep override: normal.y < 0.7 (~45°), blend over 200m transition in slope
     float steep_mix = smoothstep(0.7, 0.5, n.y);
     vec3 base_col = mix(height_col, steep_col, steep_mix);
-    
-    // 2. Distance fog (50km start, 200km full)
+
+    // 2. Selection state and staggered animation timings
+    bool is_selected = (v_is_selected > 0.5);
+    bool has_selection = (selected_hex_center.x < 900000.0);
+    float glow_fade = has_selection ? min(v_selection_time / 0.1, 1.0) : 0.0;
+    float darken_fade = has_selection ? min(v_selection_time / 0.3, 1.0) : 0.0;
+    float tint_fade = has_selection ? min(v_selection_time / 0.2, 1.0) : 0.0;
+
+    // 3. Darken surroundings when a hex is selected (before fog, so fog is not double-darkened)
+    if (has_selection && !is_selected) {
+        float darken = mix(1.0, 0.85, darken_fade);
+        base_col *= darken;
+    }
+
+    // 4. Distance fog (50km start, 200km full)
     vec3 fog_color = vec3(0.75, 0.82, 0.90);
     float dist = length(v_world_pos - camera_position);
     float fog_factor = smoothstep(50000.0, 200000.0, dist);
     base_col = mix(base_col, fog_color, fog_factor);
-    
-    // 3. Grid Logic
+
+    // 5. Selection tint (20% golden) — selected hex is brightest on screen
+    vec3 selection_tint = vec3(1.0, 0.9, 0.5);
+    if (is_selected) {
+        base_col = mix(base_col, selection_tint, 0.20 * tint_fade);
+    }
+
+    // 6. Hover: thin white border (30m), 8% tint — only when not selected
+    float dist_from_edge = hex_dist(v_world_pos.xz, hex_size);
+    vec2 current_axial = axial_round(world_to_axial(v_world_pos.xz, hex_size));
+    vec2 hovered_axial = axial_round(world_to_axial(hovered_hex_center, hex_size));
+    const float AXIAL_EPS = 0.01;
+    bool is_hovered = (abs(current_axial.x - hovered_axial.x) < AXIAL_EPS && abs(current_axial.y - hovered_axial.y) < AXIAL_EPS);
+    float hover_line_alpha = 0.0;
+    float hover_fill_alpha = 0.08;
+    if (is_hovered && !is_selected) {
+        float half_width = line_width * 0.5;
+        if (dist_from_edge < half_width) {
+            hover_line_alpha = (1.0 - smoothstep(half_width - 2.0, half_width, dist_from_edge));
+        }
+    }
+
+    // 7. Edge glow (emissive golden border at selected hex) — visible with grid off
+    vec3 glow_color = vec3(1.0, 0.8, 0.3);
+    float dist_to_sel_edge = 0.0;
+    if (has_selection) {
+        float hex_radius = hex_size * 0.5;
+        vec2 d_sel = abs(v_world_pos.xz - selected_hex_center);
+        float d1 = d_sel.y;
+        float d2 = abs(dot(d_sel, vec2(SQRT_3/2.0, 0.5)));
+        float dist_from_sel_center = max(d1, d2);
+        dist_to_sel_edge = abs(hex_radius - dist_from_sel_center);
+    }
+    float glow = glow_fade * exp(-pow(dist_to_sel_edge / 40.0, 2.0)) * (0.85 + 0.15 * sin(TIME * 2.0));
+
+    // 8. Grid lines (only when show_grid)
     float line_alpha = 0.0;
-    vec4 highlight_fill = vec4(0.0);
-    
-    // Calculate global fade based on altitude
     float grid_fade_alpha = 1.0;
     if (altitude > fade_end) {
         grid_fade_alpha = 0.0;
     } else if (altitude > fade_start) {
         grid_fade_alpha = 1.0 - (altitude - fade_start) / (fade_end - fade_start);
     }
-    
     if (show_grid && grid_fade_alpha > 0.0) {
-        float dist_from_edge = hex_dist(v_world_pos.xz, hex_size);
         float half_width = line_width * 0.5;
-        
-        // Grid Lines
         if (dist_from_edge < half_width) {
             line_alpha = (1.0 - smoothstep(half_width - 2.0, half_width, dist_from_edge)) * grid_fade_alpha;
         }
-        
-        // Selection Glow
-        if (v_is_selected > 0.5) {
-             // Golden glow for selected lifted hex
-             highlight_fill = vec4(1.0, 0.8, 0.2, 0.4);
-             
-             // Add rim effect to the lifted hex edges
-             float fresnel = pow(1.0 - clamp(dot(NORMAL, VIEW), 0.0, 1.0), 3.0);
-             highlight_fill.rgb += vec3(0.5, 0.4, 0.1) * fresnel;
-        }
-        
-        // Hover Highlight
-        vec2 current_axial = axial_round(world_to_axial(v_world_pos.xz, hex_size));
-        vec2 hovered_axial = axial_round(world_to_axial(hovered_hex_center, hex_size));
-        if (abs(current_axial.x - hovered_axial.x) < 0.1 && abs(current_axial.y - hovered_axial.y) < 0.1) {
-             // Blend hover color
-             vec4 hover_col = highlight_color;
-             vec3 out_rgb = hover_col.rgb * hover_col.a + highlight_fill.rgb * highlight_fill.a * (1.0 - hover_col.a);
-             float out_a = hover_col.a + highlight_fill.a * (1.0 - hover_col.a);
-             highlight_fill = vec4(out_rgb / max(out_a, 0.001), out_a);
-        }
     }
-    
-    // 4. Composite
-    // Start with base terrain (already colored + fogged)
+
+    // 9. Composite
     vec3 final_albedo = base_col;
-    
-    // Apply Grid Lines
+    if (is_hovered && !is_selected) {
+        final_albedo = mix(final_albedo, highlight_color.rgb, hover_fill_alpha);
+    }
+    if (hover_line_alpha > 0.0) {
+        final_albedo = mix(final_albedo, highlight_color.rgb, 0.5 * hover_line_alpha);
+    }
     if (line_alpha > 0.0) {
         final_albedo = mix(final_albedo, grid_color.rgb, grid_color.a * line_alpha);
     }
-    
-    // Apply Highlights (Selection / Hover)
-    if (highlight_fill.a > 0.0) {
-        final_albedo = mix(final_albedo, highlight_fill.rgb, highlight_fill.a);
-    }
-    
+
+    // Cap albedo to prevent blowout from any additive tint
+    final_albedo = min(final_albedo, vec3(1.5));
+
     ALBEDO = final_albedo;
+    EMISSION = glow_color * glow;
     ROUGHNESS = roughness;
     METALLIC = metallic;
     RIM = rim;

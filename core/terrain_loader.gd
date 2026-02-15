@@ -22,6 +22,20 @@ const LOD_MESH_RESOLUTION: Array[int] = [
 # SHARED MATERIAL: One material for all chunks to enable draw call batching
 var shared_terrain_material: Material = null
 
+# Height data cache: path -> heights array. FIFO, max 100 entries.
+const HEIGHT_CACHE_MAX: int = 100
+var _height_cache: Dictionary = {}
+var _height_cache_order: Array = []
+
+# Timing instrumentation: set true in Inspector (or here) for [TIME] per-chunk breakdown
+@export var DEBUG_CHUNK_TIMING: bool = false
+var _timing_png_read_parse_ms: float = 0.0
+var _timing_decompress_ms: float = 0.0
+var _timing_filter_ms: float = 0.0
+var _timing_mesh_ms: float = 0.0
+var _timing_normals_ms: float = 0.0
+var _timing_collision_ms: float = 0.0
+
 
 func _ready() -> void:
 	# Load metadata
@@ -57,6 +71,13 @@ func _ready() -> void:
 ## debug_colors: If true, color-codes chunks by LOD for visual debugging
 func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody3D, debug_colors: bool = false) -> Node3D:
 	var chunk_path: String = "res://data/terrain/chunks/lod%d/chunk_%d_%d.png" % [lod, chunk_x, chunk_y]
+	var total_t0 = Time.get_ticks_msec()
+	_timing_png_read_parse_ms = 0.0
+	_timing_decompress_ms = 0.0
+	_timing_filter_ms = 0.0
+	_timing_mesh_ms = 0.0
+	_timing_normals_ms = 0.0
+	_timing_collision_ms = 0.0
 	
 	# Check if file exists
 	if not FileAccess.file_exists(chunk_path):
@@ -106,9 +127,21 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 	mesh_instance.position = world_pos
 	
 	# Add optimized HeightMapShape3D collision for this chunk
+	var t_coll_start = Time.get_ticks_msec()
 	var collision_shape = _create_heightmap_collision_lod(heights, chunk_x, chunk_y, lod, world_pos.x, world_pos.z, vertex_spacing)
+	_timing_collision_ms = Time.get_ticks_msec() - t_coll_start
 	if collision_shape and collision_body:
 		collision_body.add_child(collision_shape)
+	
+	if DEBUG_CHUNK_TIMING:
+		var total_ms = Time.get_ticks_msec() - total_t0
+		print("[TIME] PNG read + parse: %dms" % int(_timing_png_read_parse_ms))
+		print("[TIME] Decompression: %dms" % int(_timing_decompress_ms))
+		print("[TIME] Filter reconstruction: %dms" % int(_timing_filter_ms))
+		print("[TIME] Mesh generation: %dms" % int(_timing_mesh_ms))
+		print("[TIME] Normal computation: %dms" % int(_timing_normals_ms))
+		print("[TIME] Collision shape creation: %dms" % int(_timing_collision_ms))
+		print("[TIME] Total chunk load: %dms (lod%d_x%d_y%d)" % [total_ms, lod, chunk_x, chunk_y])
 	
 	# Update statistics
 	var mesh_res = LOD_MESH_RESOLUTION[lod]
@@ -173,8 +206,13 @@ func _load_16bit_heightmap(path: String) -> Array[float]:
 	"""
 	Load 16-bit PNG heightmap. Bypasses Godot's Image.load() which downcasts to 8-bit.
 	Reads raw PNG bytes and extracts true 16-bit grayscale values.
+	Uses a FIFO cache (max 100 entries) to skip decode on re-load.
 	"""
 	var heights: Array[float] = []
+	if _height_cache.has(path):
+		print("[CACHE] Hit: %s (skipped decode)" % path.get_file())
+		return _height_cache[path]
+	print("[CACHE] Miss: %s" % path.get_file())
 	if not FileAccess.file_exists(path):
 		push_error("Heightmap file not found: " + path)
 		return heights
@@ -189,14 +227,23 @@ func _load_16bit_heightmap(path: String) -> Array[float]:
 	if heights.size() != expected_pixels:
 		push_error("Pixel count mismatch! Expected %d, got %d" % [expected_pixels, heights.size()])
 		return []
+	_add_to_height_cache(path, heights)
 	return heights
 
 
-func _parse_16bit_png_raw(path: String) -> Array[float]:
-	"""
-	Parse PNG file via FileAccess: read raw bytes, find IHDR/IDAT, decompress,
-	apply PNG row filters, and extract 16-bit big-endian grayscale values.
-	"""
+## Call from main thread to cache heights decoded on worker (async path).
+func _add_to_height_cache(path: String, heights: Array[float]) -> void:
+	if path.is_empty() or heights.is_empty():
+		return
+	if _height_cache.size() >= HEIGHT_CACHE_MAX and _height_cache_order.size() > 0:
+		var oldest = _height_cache_order.pop_front()
+		_height_cache.erase(oldest)
+	_height_cache[path] = heights
+	_height_cache_order.append(path)
+
+
+## Decode PNG to heights without touching timing (safe for background thread).
+func _decode_png_to_heights(path: String, max_elev: float) -> Array[float]:
 	var heights: Array[float] = []
 	var file = FileAccess.open(path, FileAccess.READ)
 	if not file:
@@ -248,25 +295,22 @@ func _parse_16bit_png_raw(path: String) -> Array[float]:
 	if idat_data.is_empty():
 		push_error("No IDAT chunk found")
 		return []
-	# Zlib: 2-byte header + deflate + 4-byte Adler-32.
 	if idat_data.size() < 6:
 		push_error("IDAT data too short")
 		return []
 	var row_bytes = 1 + width * 2
 	var expected_size = height * row_bytes
 	var decompressed: PackedByteArray
-	# Try raw deflate first (strip zlib header and checksum)
-	var raw_deflate = idat_data.slice(2, idat_data.size() - 4)
-	decompressed = raw_deflate.decompress(expected_size, FileAccess.COMPRESSION_DEFLATE)
+	decompressed = idat_data.decompress_dynamic(expected_size * 2, FileAccess.COMPRESSION_DEFLATE)
+	var raw_deflate: PackedByteArray
+	if decompressed.size() != expected_size:
+		raw_deflate = idat_data.slice(2, idat_data.size() - 4)
+		decompressed = raw_deflate.decompress(expected_size, FileAccess.COMPRESSION_DEFLATE)
 	if decompressed.size() != expected_size:
 		decompressed = raw_deflate.decompress_dynamic(expected_size * 2, FileAccess.COMPRESSION_DEFLATE)
-	# If still no luck, try full zlib stream (some engines expect zlib-wrapped)
-	if decompressed.size() != expected_size:
-		decompressed = idat_data.decompress_dynamic(expected_size * 2, FileAccess.COMPRESSION_DEFLATE)
 	if decompressed.size() != expected_size:
 		push_error("Decompress failed: got %d, expected %d" % [decompressed.size(), expected_size])
 		return []
-	# Parse rows: filter byte + width*2 bytes per row. Apply PNG filter and read 16-bit BE.
 	var bpp: int = 2
 	var prev_row = PackedByteArray()
 	prev_row.resize(width * 2)
@@ -276,16 +320,26 @@ func _parse_16bit_png_raw(path: String) -> Array[float]:
 		var row_start = y * row_bytes
 		var filter_type = decompressed[row_start]
 		var row_data = decompressed.slice(row_start + 1, row_start + row_bytes)
-		# Reconstruct filtered bytes into recon row (same size as row_data)
 		var recon = _png_reconstruct_row(filter_type, row_data, prev_row, bpp)
 		prev_row = recon
-		# Read big-endian uint16 per pixel
 		for x in range(width):
 			var hi = recon[x * 2]
 			var lo = recon[x * 2 + 1]
 			var value_16 = (hi << 8) | lo
-			var height_m = (float(value_16) / 65535.0) * max_elevation_m
+			var height_m = (float(value_16) / 65535.0) * max_elev
 			heights.append(height_m)
+	return heights
+
+
+func _parse_16bit_png_raw(path: String) -> Array[float]:
+	"""
+	Parse PNG file via FileAccess: read raw bytes, find IHDR/IDAT, decompress,
+	apply PNG row filters, and extract 16-bit big-endian grayscale values.
+	"""
+	var t0 = Time.get_ticks_msec()
+	var heights = _decode_png_to_heights(path, max_elevation_m)
+	_timing_png_read_parse_ms = Time.get_ticks_msec() - t0
+	# Decompress/filter time not split out; total attributed to read+parse for sync path
 	return heights
 
 
@@ -375,6 +429,7 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 	lod determines mesh resolution (LOD 0 = 512×512, LOD 4 = 32×32).
 	"""
 	
+	var t0 = Time.get_ticks_msec()
 	var mesh_res = LOD_MESH_RESOLUTION[lod]
 	var sample_stride = chunk_size_px / mesh_res # How many pixels to skip between samples
 	
@@ -412,7 +467,8 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 			)
 			vertices.append(pos)
 	
-	print("Generated %d vertices" % vertices.size())
+	if verbose:
+		print("Generated %d vertices" % vertices.size())
 	
 	# Generate indices (two triangles per quad)
 	# IMPORTANT: Counter-clockwise winding for Godot (facing up)
@@ -436,8 +492,11 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 	if verbose:
 		print("Generated %d triangles" % (indices.size() / 3))
 	
+	_timing_mesh_ms = Time.get_ticks_msec() - t0
+	var t_norm = Time.get_ticks_msec()
 	# Compute normals with LOD-aware spacing
 	normals = _compute_normals_lod_decimated(heights, actual_vertex_spacing, mesh_res, sample_stride, lod)
+	_timing_normals_ms = Time.get_ticks_msec() - t_norm
 	
 	# Build mesh
 	var arrays = []
@@ -569,3 +628,157 @@ func _create_heightmap_collision_lod(heights: Array[float], chunk_x: int, chunk_
 	collision_shape.scale = Vector3(height_sample_spacing, 1.0, height_sample_spacing)
 	
 	return collision_shape
+
+
+# --- Async load: Phase A (background) produces arrays; Phase B (main) creates nodes ---
+
+## Start async load: Phase A runs on WorkerThreadPool. Returns { task_id, args }.
+## Caller stores args; when is_task_completed(task_id), wait then finish_load(args["result"], ...).
+func start_async_load(chunk_x: int, chunk_y: int, lod: int) -> Dictionary:
+	var chunk_path: String = "res://data/terrain/chunks/lod%d/chunk_%d_%d.png" % [lod, chunk_x, chunk_y]
+	var args: Dictionary = {
+		"chunk_x": chunk_x,
+		"chunk_y": chunk_y,
+		"lod": lod,
+		"resolution_m": resolution_m,
+		"chunk_size_px": chunk_size_px,
+		"max_elevation_m": max_elevation_m,
+		"LOD_MESH_RESOLUTION": LOD_MESH_RESOLUTION.duplicate(),
+		"result": {}
+	}
+	if _height_cache.has(chunk_path):
+		args["heights"] = _height_cache[chunk_path]
+	else:
+		args["path"] = chunk_path
+	var callable_task = Callable(self, "_compute_chunk_data").bind(args)
+	var task_id = WorkerThreadPool.add_task(callable_task, false, "chunk_lod%d_%d_%d" % [lod, chunk_x, chunk_y])
+	print("[ASYNC] Submitted lod%d_x%d_y%d" % [lod, chunk_x, chunk_y])
+	return { "task_id": task_id, "args": args }
+
+
+## Phase A: run on worker. No Nodes, no scene tree. Writes computed arrays into args["result"].
+func _compute_chunk_data(args: Dictionary) -> void:
+	var lod: int = args["lod"]
+	var chunk_x: int = args["chunk_x"]
+	var chunk_y: int = args["chunk_y"]
+	var res_m: float = args["resolution_m"]
+	var cpx: int = args["chunk_size_px"]
+	var max_elev: float = args["max_elevation_m"]
+	var mesh_resolutions: Array = args["LOD_MESH_RESOLUTION"]
+	var heights: Array[float]
+	var did_decode: bool = false
+	if args.has("heights"):
+		heights = args["heights"]
+	else:
+		heights = _decode_png_to_heights(args["path"], max_elev)
+		did_decode = true
+	if heights.is_empty():
+		args["result"] = {}
+		return
+	var mesh_res: int = mesh_resolutions[lod]
+	var sample_stride: int = cpx / mesh_res
+	var lod_scale: int = int(pow(2, lod))
+	var chunk_world_size: float = cpx * res_m * lod_scale
+	var actual_vertex_spacing: float = chunk_world_size / float(mesh_res - 1)
+	var vertices = PackedVector3Array()
+	var indices = PackedInt32Array()
+	for y in range(mesh_res):
+		for x in range(mesh_res):
+			var px = mini(x * sample_stride, cpx - 1)
+			var py = mini(y * sample_stride, cpx - 1)
+			var h = heights[py * cpx + px]
+			vertices.append(Vector3(x * actual_vertex_spacing, h, y * actual_vertex_spacing))
+	for y in range(mesh_res - 1):
+		for x in range(mesh_res - 1):
+			var top_left = y * mesh_res + x
+			var top_right = top_left + 1
+			var bottom_left = (y + 1) * mesh_res + x
+			var bottom_right = bottom_left + 1
+			indices.append(top_left)
+			indices.append(top_right)
+			indices.append(bottom_left)
+			indices.append(top_right)
+			indices.append(bottom_right)
+			indices.append(bottom_left)
+	var normals = _compute_normals_lod_decimated(heights, actual_vertex_spacing, mesh_res, sample_stride, lod)
+	var height_data = PackedFloat32Array()
+	height_data.resize(mesh_res * mesh_res)
+	for y in range(mesh_res):
+		for x in range(mesh_res):
+			var px = mini(x * sample_stride, cpx - 1)
+			var py = mini(y * sample_stride, cpx - 1)
+			height_data[y * mesh_res + x] = heights[py * cpx + px]
+	var world_pos = Vector3(chunk_x * chunk_world_size, 0, chunk_y * chunk_world_size)
+	var height_sample_spacing = chunk_world_size / float(mesh_res - 1)
+	args["result"] = {
+		"vertices": vertices,
+		"normals": normals,
+		"indices": indices,
+		"height_data": height_data,
+		"chunk_x": chunk_x,
+		"chunk_y": chunk_y,
+		"lod": lod,
+		"world_pos": world_pos,
+		"mesh_res": mesh_res,
+		"chunk_world_size": chunk_world_size,
+		"height_sample_spacing": height_sample_spacing,
+		"heights_for_cache": heights if did_decode else [],
+		"path_for_cache": args.get("path", "")
+	}
+
+
+## Phase B: main thread only. Creates ArrayMesh, MeshInstance3D, collision; returns the mesh node.
+func finish_load(computed_data: Dictionary, collision_body: StaticBody3D, debug_colors: bool = false) -> Node3D:
+	var t0 = Time.get_ticks_msec()
+	if computed_data.is_empty():
+		return null
+	var vertices: PackedVector3Array = computed_data["vertices"]
+	var normals: PackedVector3Array = computed_data["normals"]
+	var indices: PackedInt32Array = computed_data["indices"]
+	var height_data: PackedFloat32Array = computed_data["height_data"]
+	var chunk_x: int = computed_data["chunk_x"]
+	var chunk_y: int = computed_data["chunk_y"]
+	var lod: int = computed_data["lod"]
+	var world_pos: Vector3 = computed_data["world_pos"]
+	var mesh_res: int = computed_data["mesh_res"]
+	var chunk_world_size: float = computed_data["chunk_world_size"]
+	var height_sample_spacing: float = computed_data["height_sample_spacing"]
+	var arrays: Array = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = vertices
+	arrays[Mesh.ARRAY_NORMAL] = normals
+	arrays[Mesh.ARRAY_INDEX] = indices
+	var mesh = ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	var mesh_instance = MeshInstance3D.new()
+	mesh_instance.name = "Chunk_LOD%d_%d_%d" % [lod, chunk_x, chunk_y]
+	mesh_instance.mesh = mesh
+	if debug_colors:
+		var debug_material = StandardMaterial3D.new()
+		var colors = [
+			Color(0.0, 1.0, 0.0), Color(1.0, 1.0, 0.0), Color(1.0, 0.5, 0.0),
+			Color(1.0, 0.0, 0.0), Color(1.0, 0.0, 1.0)
+		]
+		debug_material.albedo_color = colors[lod]
+		debug_material.roughness = 0.9
+		debug_material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
+		debug_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+		mesh_instance.set_surface_override_material(0, debug_material)
+	else:
+		mesh_instance.set_surface_override_material(0, shared_terrain_material)
+	mesh_instance.position = world_pos
+	var heightmap_shape = HeightMapShape3D.new()
+	heightmap_shape.map_width = mesh_res
+	heightmap_shape.map_depth = mesh_res
+	heightmap_shape.map_data = height_data
+	var collision_shape = CollisionShape3D.new()
+	collision_shape.shape = heightmap_shape
+	collision_shape.name = "HeightMap_LOD%d_%d_%d" % [lod, chunk_x, chunk_y]
+	var half_size = chunk_world_size * 0.5
+	collision_shape.position = Vector3(world_pos.x + half_size, 0, world_pos.z + half_size)
+	collision_shape.scale = Vector3(height_sample_spacing, 1.0, height_sample_spacing)
+	if collision_body:
+		collision_body.add_child(collision_shape)
+	var phase_b_ms = Time.get_ticks_msec() - t0
+	print("[ASYNC] Completed lod%d_x%d_y%d (Phase B: %dms)" % [lod, chunk_x, chunk_y, int(phase_b_ms)])
+	return mesh_instance
