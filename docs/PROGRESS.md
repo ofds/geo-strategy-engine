@@ -13,33 +13,31 @@
 | **`ui/loading_screen.gd`** | ✅ Stable | Simple progress bar for initial bulk chunk loading. |
 | `config/constants.gd` | ✅ Stable | Global configuration (LOD distances, chunk sizes, memory budgets). |
 | `tools/process_terrain.py` | ✅ Stable | Python CLI pipeline. Downloads SRTM data, merges, and tiles into 512px 16-bit PNGs. |
+| **`rendering/hex_overlay.gdshader`** | ✅ Stable | Procedural hex grid shader with altitude fading and interaction. |
 
-## 🚀 Current System Status (Phase 4b Complete)
+## 🚀 Current System Status (Phase 5 Complete)
 
-The **Dynamic Chunk Streaming** system is fully operational and stable.
+The **Dynamic Chunk Streaming** system is fully operational, now with a **Hex Grid Overlay**.
 
-*   **Streaming**: Loads up to 8 chunks/sec based on camera position. Unloads chunks that fall out of range or are covered by finer LODs.
-*   **LOD System**: 5 levels (LOD 0-4).
-    *   **LOD 0**: 0-25km (Full detail).
-    *   **LOD 4**: >200km (Lowest detail).
-    *   **Hysteresis**: 10% buffer prevents flickering at LOD boundaries. Upgrade to finer LOD is immediate; downgrade is buffered.
-*   **Visuals**: No seams, no gaps, no z-fighting. Coarse chunks persist until fully replaced by finer chunks (deferred unloading).
-*   **Performance**:
-    *   **Collision**: Optimized `HeightMapShape3D` (orders of magnitude faster than trimesh).
-    *   **Batching**: Single shared `StandardMaterial3D` across all chunks.
+*   **Streaming**: Loads up to 8 chunks/sec based on camera position.
+*   **LOD System**: 5 levels (LOD 0-4) with hysteresis.
+*   **Hex Grid Overlay**:
+    *   Shader-based projection on terrain (no extra geometry).
+    *   1km flat-top hexes.
+    *   Fades out between 5km and 20km altitude.
+    *   Mouse hover highlight & coordinate debug label.
+    *   Toggle with **F1**.
 
 ## 📊 Current Performance Benchmarks
 
 **Platform:** AMD Radeon RX 9070 XT
-**Region:** Alps Test (45.5°N-48°N / 6°E-10.5°E)
+**Region:** Alps Test
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **FPS** | **100 - 180+** | Stable during fast movement. |
-| **Draw Calls** | **~55** | Excellent batching efficiency. |
-| **Loaded Chunks** | **44 - 48** | Stable count. No accumulation/leaks. |
-| **Vertices** | **~3.5M** | Dynamic LOD mesh decimation (97% reduction vs full detail). |
-| **Load Time** | **~2 sec** | Initial cold start (synchronous). |
+| **FPS** | **100 - 180+** | Minimal impact from hex shader. |
+| **Draw Calls** | **~55** | Stable. |
+| **Loaded Chunks** | **44 - 48** | Stable count. |
 
 ## 📋 Backlog
 
@@ -49,15 +47,17 @@ The **Dynamic Chunk Streaming** system is fully operational and stable.
 
 ## 🔮 What To Do Next
 
-1.  **Terrain Coloring**: Replace the debug green material with a shader that colors based on slope/height (snow on peaks, grass in valleys, rock on cliffs).
-2.  **Hex Grid Overlay**: Implement a shader-based hex grid projected onto the terrain for gameplay logic.
+1.  **Terrain Coloring**: Replace debug green material with slope/height-based shader.
+2.  **Hex Data Layer**: Attach gameplay data to hexes (biome, owner, unit count).
 
 ## ⚡ Quick Start
 
-1.  **Open Project**: Godot 4.3+.
-2.  **Run Demo**: Press **F5** (runs `res://scenes/terrain_demo.tscn`).
-3.  **Controls**:
-    *   **WASD**: Move camera.
-    *   **Space (Hold)**: 10× Speed Boost.
-    *   **Mouse Wheel**: Zoom (Interpolated).
+1.  **Run Demo**: **F5**.
+2.  **Controls**:
+    *   **WASD**: Move.
+    *   **Space (Hold)**: Speed Boost.
+    *   **Mouse Wheel**: Zoom.
     *   **Middle Mouse**: Orbit.
+    *   **F1**: Toggle Hex Grid.
+
+> **Note:** Fixed "x-ray" visual artifact where grid lines from hidden LOD chunks were visible. Shader now uses proper depth testing.

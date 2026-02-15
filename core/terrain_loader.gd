@@ -7,16 +7,16 @@ extends Node
 # Metadata from terrain_metadata.json
 var terrain_metadata: Dictionary = {}
 var max_elevation_m: float = 4810.0
-var resolution_m: float = 30.0  # Base resolution at LOD 0
+var resolution_m: float = 30.0 # Base resolution at LOD 0
 var chunk_size_px: int = 512
 
 # Mesh resolution per LOD level (vertex grid size)
 const LOD_MESH_RESOLUTION: Array[int] = [
-	512,  # LOD 0: Full detail (512×512 = 262k vertices)
-	256,  # LOD 1: Quarter detail (256×256 = 65k vertices)
-	128,  # LOD 2: 1/16 detail (128×128 = 16k vertices)
-	64,   # LOD 3: 1/64 detail (64×64 = 4k vertices)
-	32,   # LOD 4: 1/256 detail (32×32 = 1k vertices)
+	512, # LOD 0: Full detail (512×512 = 262k vertices)
+	256, # LOD 1: Quarter detail (256×256 = 65k vertices)
+	128, # LOD 2: 1/16 detail (128×128 = 16k vertices)
+	64, # LOD 3: 1/64 detail (64×64 = 4k vertices)
+	32, # LOD 4: 1/256 detail (32×32 = 1k vertices)
 ]
 
 # SHARED MATERIAL: One material for all chunks to enable draw call batching
@@ -31,16 +31,31 @@ func _ready() -> void:
 	
 	# Create SHARED material for all chunks (enables draw call batching)
 	shared_terrain_material = StandardMaterial3D.new()
-	shared_terrain_material.albedo_color = Color(0.4, 0.6, 0.3)  # Greenish terrain color
+	shared_terrain_material.albedo_color = Color(0.4, 0.6, 0.3) # Greenish terrain color
 	shared_terrain_material.roughness = 0.9
 	shared_terrain_material.metallic = 0.0
 	shared_terrain_material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
-	shared_terrain_material.cull_mode = BaseMaterial3D.CULL_DISABLED  # Render both sides
+	shared_terrain_material.cull_mode = BaseMaterial3D.CULL_DISABLED # Render both sides
 	
 	# Add subtle rim lighting to help with faceting
 	shared_terrain_material.rim_enabled = true
 	shared_terrain_material.rim = 0.15
 	shared_terrain_material.rim_tint = 0.3
+	
+	# Hex Grid Overlay (Next Pass)
+	var hex_shader = load("res://rendering/hex_overlay.gdshader")
+	if hex_shader:
+		var hex_material = ShaderMaterial.new()
+		hex_material.shader = hex_shader
+		
+		# Set initial uniforms from Constants
+		hex_material.set_shader_parameter("hex_size", Constants.HEX_SIZE_M)
+		hex_material.set_shader_parameter("fade_start", Constants.GRID_FADE_START_M)
+		hex_material.set_shader_parameter("fade_end", Constants.GRID_FADE_END_M)
+		
+		shared_terrain_material.next_pass = hex_material
+	else:
+		push_error("TerrainLoader: Failed to load hex overlay shader!")
 
 
 ## Load a single chunk and return a complete Node3D with mesh and collision
@@ -68,7 +83,7 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 	var vertex_spacing = resolution_m * lod_scale
 	
 	# Generate mesh with LOD-scaled vertex spacing and decimated resolution
-	var mesh = _generate_mesh_lod(heights, vertex_spacing, lod, false)  # Pass false to disable verbose logging
+	var mesh = _generate_mesh_lod(heights, vertex_spacing, lod, false) # Pass false to disable verbose logging
 	
 	# Create MeshInstance3D
 	var mesh_instance = MeshInstance3D.new()
@@ -81,11 +96,11 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 		var debug_material = StandardMaterial3D.new()
 		# Color by LOD: LOD0=green, LOD1=yellow, LOD2=orange, LOD3=red, LOD4=purple
 		var colors = [
-			Color(0.0, 1.0, 0.0),    # LOD 0: Bright green
-			Color(1.0, 1.0, 0.0),    # LOD 1: Yellow
-			Color(1.0, 0.5, 0.0),    # LOD 2: Orange
-			Color(1.0, 0.0, 0.0),    # LOD 3: Red
-			Color(1.0, 0.0, 1.0),    # LOD 4: Magenta
+			Color(0.0, 1.0, 0.0), # LOD 0: Bright green
+			Color(1.0, 1.0, 0.0), # LOD 1: Yellow
+			Color(1.0, 0.5, 0.0), # LOD 2: Orange
+			Color(1.0, 0.0, 0.0), # LOD 3: Red
+			Color(1.0, 0.0, 1.0), # LOD 4: Magenta
 		]
 		debug_material.albedo_color = colors[lod]
 		debug_material.roughness = 0.9
@@ -116,7 +131,7 @@ func _chunk_to_world_position(chunk_x: int, chunk_y: int, lod: int) -> Vector3:
 	Convert chunk grid coordinates to world position.
 	Each LOD level has different chunk sizes in world space.
 	"""
-	var lod_scale = int(pow(2, lod))  # LOD 0 = 1x, LOD 1 = 2x, LOD 2 = 4x, etc.
+	var lod_scale = int(pow(2, lod)) # LOD 0 = 1x, LOD 1 = 2x, LOD 2 = 4x, etc.
 	var world_chunk_size = chunk_size_px * resolution_m * lod_scale
 	
 	return Vector3(
@@ -152,7 +167,7 @@ func _load_metadata() -> bool:
 	
 	# Extract key values
 	max_elevation_m = terrain_metadata.get("max_elevation_m", 4810.0)
-	resolution_m = terrain_metadata.get("resolution_m", 30.0)  # Base resolution (LOD 0)
+	resolution_m = terrain_metadata.get("resolution_m", 30.0) # Base resolution (LOD 0)
 	chunk_size_px = terrain_metadata.get("chunk_size_px", 512)
 	
 	print("Terrain metadata loaded:")
@@ -305,7 +320,7 @@ func _extract_heights_from_8bit(image: Image) -> Array[float]:
 	for y in range(chunk_size_px):
 		for x in range(chunk_size_px):
 			var pixel = image.get_pixel(x, y)
-			var gray_8bit = pixel.r  # 0.0 to 1.0
+			var gray_8bit = pixel.r # 0.0 to 1.0
 			var height_m = gray_8bit * max_elevation_m
 			heights.append(height_m)
 	
@@ -321,12 +336,12 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 	"""
 	
 	var mesh_res = LOD_MESH_RESOLUTION[lod]
-	var sample_stride = chunk_size_px / mesh_res  # How many pixels to skip between samples
+	var sample_stride = chunk_size_px / mesh_res # How many pixels to skip between samples
 	
 	# Calculate the actual world-space vertex spacing accounting for both LOD scale AND decimation
 	var lod_scale = int(pow(2, lod))
 	var chunk_world_size = chunk_size_px * resolution_m * lod_scale
-	var actual_vertex_spacing = chunk_world_size / float(mesh_res - 1)  # -1 because we want edge-to-edge
+	var actual_vertex_spacing = chunk_world_size / float(mesh_res - 1) # -1 because we want edge-to-edge
 	
 	if verbose:
 		print("Generating mesh: LOD %d, %d×%d vertices, %.1fm spacing..." % [lod, mesh_res, mesh_res, actual_vertex_spacing])
