@@ -1,0 +1,87 @@
+[gd_scene load_steps=6 format=3 uid="uid://do3a3bxwl1xjy"]
+
+[ext_resource type="Script" uid="uid://dyrv4lovx4xh0" path="res://core/terrain_loader.gd" id="1_terrain"]
+[ext_resource type="Script" path="res://core/chunk_manager.gd" id="2_chunk_manager"]
+[ext_resource type="Script" uid="uid://caokqviv0yju5" path="res://rendering/basic_camera.gd" id="3_camera"]
+[ext_resource type="Script" path="res://ui/loading_screen.gd" id="4_loading"]
+[ext_resource type="Script" path="res://ui/fps_counter.gd" id="5_fps"]
+
+[sub_resource type="Environment" id="Environment_1"]
+background_mode = 1
+background_color = Color(0.53, 0.68, 0.85, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.6, 0.6, 0.65, 1)
+ambient_light_energy = 0.8
+tonemap_mode = 2
+tonemap_white = 8.0
+
+[node name="TerrainDemo" type="Node3D"]
+
+[node name="TerrainLoader" type="Node" parent="."]
+script = ExtResource("1_terrain")
+
+[node name="ChunkManager" type="Node3D" parent="."]
+script = ExtResource("2_chunk_manager")
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.707107, 0.707107, 0, -0.707107, 0.707107, 0, 100, 100)
+fov = 60.0
+script = ExtResource("3_camera")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.866025, -0.433013, 0.25, 0, 0.5, 0.866025, -0.5, -0.75, 0.433013, 0, 5000, 0)
+light_color = Color(1, 0.98, 0.95, 1)
+light_energy = 1.0
+shadow_enabled = true
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_1")
+
+[node name="FPSCounter" type="CanvasLayer" parent="."]
+
+[node name="Label" type="Label" parent="FPSCounter"]
+offset_left = 10.0
+offset_top = 10.0
+offset_right = 300.0
+offset_bottom = 80.0
+theme_override_colors/font_color = Color(1, 1, 1, 1)
+theme_override_colors/font_shadow_color = Color(0, 0, 0, 1)
+theme_override_constants/shadow_offset_x = 1
+theme_override_constants/shadow_offset_y = 1
+theme_override_font_sizes/font_size = 16
+text = "FPS: 0
+Draw Calls: 0"
+script = ExtResource("5_fps")
+
+[node name="LoadingScreen" type="CanvasLayer" parent="."]
+script = ExtResource("4_loading")
+
+[node name="Panel" type="Panel" parent="LoadingScreen"]
+offset_left = 400.0
+offset_top = 250.0
+offset_right = 880.0
+offset_bottom = 350.0
+
+[node name="VBoxContainer" type="VBoxContainer" parent="LoadingScreen/Panel"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 20.0
+offset_top = 20.0
+offset_right = -20.0
+offset_bottom = -20.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="StatusLabel" type="Label" parent="LoadingScreen/Panel/VBoxContainer"]
+layout_mode = 2
+text = "Loading terrain chunks..."
+horizontal_alignment = 1
+
+[node name="ProgressBar" type="ProgressBar" parent="LoadingScreen/Panel/VBoxContainer"]
+custom_minimum_size = Vector2(0, 30)
+layout_mode = 2
+max_value = 9.0
+step = 1.0
+show_percentage = false

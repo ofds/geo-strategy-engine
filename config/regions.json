@@ -1,0 +1,29 @@
+{
+  "active_region": "alps_test",
+  "regions": {
+	"alps_test": {
+	  "display_name": "Alps Test Region",
+	  "description": "Switzerland and northern Italy. Small region for development and testing.",
+	  "bounding_box": {
+		"lat_min": 45.5,
+		"lat_max": 48,
+		"lon_min": 6,
+		"lon_max": 10.5
+	  },
+	  "max_elevation_m": 4810,
+	  "notes": "Covers Mont Blanc, Matterhorn, Jungfrau, Lake Geneva, Lake Como. ~278 km x 500 km."
+	},
+	"europe": {
+	  "display_name": "Europe",
+	  "description": "Full European continent. Use for final validation and release.",
+	  "bounding_box": {
+		"lat_min": 36,
+		"lat_max": 71,
+		"lon_min": -10,
+		"lon_max": 40
+	  },
+	  "max_elevation_m": 4810,
+	  "notes": "Primary test region per spec Section 14.2. Processing time ~15 min on 8-core CPU."
+	}
+  }
+}
