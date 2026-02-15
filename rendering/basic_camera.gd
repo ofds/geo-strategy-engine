@@ -106,6 +106,83 @@ func _input(event: InputEvent) -> void:
 			
 			_update_camera_transform()
 
+	# Mouse Click - Hex Selection
+	elif event is InputEventMouseButton:
+		if event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
+			_handle_hex_selection_click(event.position)
+
+
+func _handle_hex_selection_click(screen_pos: Vector2) -> void:
+	# Raycast to find clicked hex
+	var space_state = get_world_3d().direct_space_state
+	var ray_origin = project_ray_origin(screen_pos)
+	var ray_end = ray_origin + project_ray_normal(screen_pos) * 500000.0
+	
+	var query = PhysicsRayQueryParameters3D.create(ray_origin, ray_end)
+	query.collision_mask = 1
+	var result = space_state.intersect_ray(query)
+	
+	if result:
+		var hit_pos = result.position
+		
+		# Convert to hex
+		var width = Constants.HEX_SIZE_M
+		var hex_size = width / sqrt(3.0)
+		
+		var q = (2.0 / 3.0 * hit_pos.x) / hex_size
+		var r = (-1.0 / 3.0 * hit_pos.x + sqrt(3.0) / 3.0 * hit_pos.z) / hex_size
+		
+		var hex_axial = _axial_round(Vector2(q, r))
+		var hex_q = int(hex_axial.x)
+		var hex_r = int(hex_axial.y)
+		
+		# Calculate Center
+		var center_x = hex_size * (3.0 / 2.0 * hex_q)
+		var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
+		var center = Vector2(center_x, center_z)
+		
+		# Toggle selection
+		if _selected_hex_center.distance_to(center) < 1.0:
+			# Deselect if clicking same hex
+			_selected_hex_center = Vector2(999999, 999999)
+		else:
+			# Select new hex
+			_selected_hex_center = center
+			# Signal or print for now
+			print("Hex Selected: (%d, %d)" % [hex_q, hex_r])
+	else:
+		# Clicked sky/nothing -> Deselect
+		_selected_hex_center = Vector2(999999, 999999)
+	
+	# Update Shader immediately
+	_update_hex_selection_uniform()
+
+
+var _selected_hex_center: Vector2 = Vector2(999999, 999999)
+
+func _update_hex_selection_uniform() -> void:
+	# Find material (reusing logic from _update_hex_grid_interaction or caching it would be better)
+	# For now, quick lookup same as before
+	var terrain_material: ShaderMaterial = null
+	var chunk = get_tree().get_first_node_in_group("terrain_chunks")
+	if chunk and chunk is MeshInstance3D:
+		var mat = chunk.get_surface_override_material(0)
+		if mat and mat.next_pass is ShaderMaterial:
+			terrain_material = mat.next_pass
+	
+	# Fallback search
+	if not terrain_material:
+		var root = get_tree().root
+		if root:
+			var node = _find_chunk_recursive(root)
+			if node:
+				var mat = node.get_surface_override_material(0)
+				if mat and mat.next_pass is ShaderMaterial:
+					terrain_material = mat.next_pass
+	
+	if terrain_material:
+		terrain_material.set_shader_parameter("selected_hex_center", _selected_hex_center)
+
 
 func _process(delta: float) -> void:
 	# Check for speed boost (Space key)
@@ -297,26 +374,36 @@ func _update_hex_grid_interaction() -> void:
 			var hit_pos = result.position
 			
 			# Convert hit_pos to Hex Coordinates
-			# Flat-top hex math
+			# Flat-top hex math (matching shader exactly)
 			# Width (flat-to-flat) = HEX_SIZE_M (1000.0)
 			# Size (center-to-corner) = Width / sqrt(3)
 			var width = Constants.HEX_SIZE_M
-			var size = width / sqrt(3.0)
+			var hex_size = width / sqrt(3.0)
 			
-			var q = (2.0 / 3.0 * hit_pos.x) / size
-			var r = (-1.0 / 3.0 * hit_pos.x + sqrt(3.0) / 3.0 * hit_pos.z) / size
+			# Axial coordinates (q, r)
+			# q = (2/3 * x) / size
+			# r = (-1/3 * x + sqrt(3)/3 * z) / size
+			var q = (2.0 / 3.0 * hit_pos.x) / hex_size
+			var r = (-1.0 / 3.0 * hit_pos.x + sqrt(3.0) / 3.0 * hit_pos.z) / hex_size
 			
 			# Round to nearest hex
 			var hex_axial = _axial_round(Vector2(q, r))
 			var hex_q = int(hex_axial.x)
 			var hex_r = int(hex_axial.y)
 			
-			# Calculate World Center of this hex
-			var center_x = size * (3.0 / 2.0 * hex_q)
-			var center_z = size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
+			# Calculate World Center of hit hex
+			# x = size * (3/2 * q)
+			# z = size * (sqrt(3)/2 * q + sqrt(3) * r)
+			var center_x = hex_size * (3.0 / 2.0 * hex_q)
+			var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
 			
 			# Pass to Shader
 			terrain_material.set_shader_parameter("hovered_hex_center", Vector2(center_x, center_z))
+			
+			# Debug Print (temporary, remove if spammy)
+			# print("Hit: (%.1f, %.1f) -> Hex: (%d, %d) -> Center: (%.1f, %.1f) -> Dist: %.1f" % 
+			# 	[hit_pos.x, hit_pos.z, hex_q, hex_r, center_x, center_z, 
+			# 	Vector2(hit_pos.x, hit_pos.z).distance_to(Vector2(center_x, center_z))])
 			
 			# Show Debug Label
 			_update_debug_label(hex_q, hex_r)

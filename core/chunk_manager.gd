@@ -24,16 +24,16 @@ var initial_load_complete: bool = false
 # Constants
 const LOD_DISTANCES_M: Array[float] = [0.0, 25000.0, 50000.0, 100000.0, 200000.0]
 const LOD_GRID_SIZES: Array = [
-	Vector2i(32, 18),  # LOD 0
-	Vector2i(16, 9),   # LOD 1
-	Vector2i(8, 5),    # LOD 2
-	Vector2i(4, 3),    # LOD 3
-	Vector2i(2, 2),    # LOD 4
+	Vector2i(32, 18), # LOD 0
+	Vector2i(16, 9), # LOD 1
+	Vector2i(8, 5), # LOD 2
+	Vector2i(4, 3), # LOD 3
+	Vector2i(2, 2), # LOD 4
 ]
-const LOD_HYSTERESIS: float = 0.10  # 10% buffer at LOD boundaries
-const CHUNK_SIZE_M: float = 15360.0  # 512px * 30m = 15.36 km per LOD 0 chunk
-const MAX_LOADS_PER_UPDATE: int = 8  # Increased from 4 for faster loading
-const DEFERRED_UNLOAD_TIMEOUT_S: float = 5.0  # Unload after 5s regardless
+const LOD_HYSTERESIS: float = 0.10 # 10% buffer at LOD boundaries
+const CHUNK_SIZE_M: float = 15360.0 # 512px * 30m = 15.36 km per LOD 0 chunk
+const MAX_LOADS_PER_UPDATE: int = 8 # Increased from 4 for faster loading
+const DEFERRED_UNLOAD_TIMEOUT_S: float = 5.0 # Unload after 5s regardless
 
 # Hysteresis tracking: Key = "lod0_x_y", Value = current_lod
 var lod_hysteresis_state: Dictionary = {}
@@ -148,7 +148,7 @@ func _update_chunks() -> void:
 	# DIAGNOSTIC: Track camera position changes to detect drift
 	var camera_moved = false
 	
-	if camera_pos.distance_to(diagnostic_last_camera_pos) > 0.1:  # Moved more than 10cm
+	if camera_pos.distance_to(diagnostic_last_camera_pos) > 0.1: # Moved more than 10cm
 		camera_moved = true
 		diagnostic_camera_stable_count = 0
 	else:
@@ -179,7 +179,7 @@ func _update_chunks() -> void:
 	print("  Camera XZ: (%.1f, %.1f) - %s" % [camera_pos.x, camera_pos.z, "MOVING" if camera_moved else "STABLE (%d cycles)" % diagnostic_camera_stable_count])
 	print("  Desired LOD 0 chunks: %d" % desired_lod0_count)
 	print("  Loaded LOD 0 chunks: %d" % loaded_lod0_count)
-	print("  Loaded: %d total (LOD0=%d, LOD1=%d, LOD2=%d, LOD3=%d, LOD4=%d)" % 
+	print("  Loaded: %d total (LOD0=%d, LOD1=%d, LOD2=%d, LOD3=%d, LOD4=%d)" %
 		[loaded_chunks.size(), lod_counts[0], lod_counts[1], lod_counts[2], lod_counts[3], lod_counts[4]])
 	
 	var to_load: Array = []
@@ -253,7 +253,7 @@ func _update_chunks() -> void:
 			else:
 				# Keep it for now - only log if pending loads
 				if to_load.size() > 0:
-					print("[Stream] Keeping %s (LOD%d): %d/%d cells need finer coverage (%.1fs)" % 
+					print("[Stream] Keeping %s (LOD%d): %d/%d cells need finer coverage (%.1fs)" %
 						[key, chunk_lod, cells_total - cells_covered_by_finer, cells_total, deferred_duration])
 		
 		if should_unload:
@@ -293,8 +293,54 @@ func _update_chunks() -> void:
 	
 	# Log update
 	if to_load.size() > 0 or to_unload.size() > 0:
-		print("[Stream] Update: loaded=%d, +%d loaded, -%d unloaded, %d pending, interval=%.2fs" % 
+		print("[Stream] Update: loaded=%d, +%d loaded, -%d unloaded, %d pending, interval=%.2fs" %
 			[loaded_chunks.size(), loaded_count, to_unload.size(), to_load.size() - loaded_count, current_update_interval])
+	
+	# Update Visibility (LOD Occlusion)
+	_update_chunk_visibility()
+
+
+func _update_chunk_visibility() -> void:
+	# Iterate over all loaded chunks
+	# If a chunk is covered by a finer LOD (higher resolution, lower LOD index), hide it.
+	for key in loaded_chunks:
+		var chunk_info = loaded_chunks[key]
+		var chunk_node = chunk_info.node
+		var lod = chunk_info.lod
+		var cx = chunk_info.x
+		var cy = chunk_info.y
+		
+		# For LOD 0, always show (highest detail)
+		if lod == 0:
+			chunk_node.visible = true
+			continue
+			
+		# For LOD > 0, check if we are covered by Finer LOD (lod - 1)
+		# A chunk at LOD N (cx, cy) corresponds to 4 chunks at LOD N-1
+		# We hide ONLY if ALL 4 finer chunks are loaded and visible.
+		
+		var finer_lod = lod - 1
+		# Child coordinates (2x resolution)
+		var min_fine_x = cx * 2
+		var min_fine_y = cy * 2
+		
+		var all_finer_loaded = true
+		for dy in range(2):
+			for dx in range(2):
+				var fine_key = "lod%d_x%d_y%d" % [finer_lod, min_fine_x + dx, min_fine_y + dy]
+				if not loaded_chunks.has(fine_key):
+					all_finer_loaded = false
+					break
+			if not all_finer_loaded:
+				break
+		
+		# Limit check to grid bounds?
+		# Actually, if the fine chunk is out of grid, it won't be in loaded_chunks, so all_finer_loaded will be false.
+		# That's correct behavior (we need the coarse chunk).
+		# Exception: Edge of world. If fine chunks don't exist because they are outside map?
+		# The ChunkManager grid logic usually handles this.
+		
+		chunk_node.visible = not all_finer_loaded
 
 
 func _is_cell_covered_by_finer_loaded(lod0_x: int, lod0_y: int, current_lod: int) -> bool:
@@ -340,7 +386,7 @@ func _is_cell_covered_by_loaded_desired(lod0_x: int, lod0_y: int, desired: Dicti
 	"""Check if a LOD 0 cell is covered by a LOADED chunk that's also in the desired set."""
 	for key in desired.keys():
 		if not loaded_chunks.has(key):
-			continue  # Skip chunks that aren't loaded yet
+			continue # Skip chunks that aren't loaded yet
 		
 		var chunk_info = desired[key]
 		var lod_scale = int(pow(2, chunk_info.lod))
@@ -385,7 +431,7 @@ func _determine_desired_chunks(camera_pos: Vector3) -> Dictionary:
 		print("  LOD 0 cells: %s" % lod0_cells_str)
 		
 		# Check if desired set changed from last cycle (for determinism verification)
-		if camera_pos.distance_to(diagnostic_last_desired_camera_pos) < 0.1:  # Camera hasn't moved
+		if camera_pos.distance_to(diagnostic_last_desired_camera_pos) < 0.1: # Camera hasn't moved
 			if lod0_cells_str != diagnostic_last_lod0_cells_str and diagnostic_last_lod0_cells_str != "":
 				print("  [ERROR] Desired set changed while camera is stationary! Non-deterministic!")
 				print("    Previous: %s" % diagnostic_last_lod0_cells_str)
@@ -396,10 +442,10 @@ func _determine_desired_chunks(camera_pos: Vector3) -> Dictionary:
 	
 	# Step 2: Build desired set with proper deduplication - finest LOD wins, no overlaps
 	var desired: Dictionary = {}
-	var covered_cells: Dictionary = {}  # Key = "x_y", Value = true if covered
+	var covered_cells: Dictionary = {} # Key = "x_y", Value = true if covered
 	
 	# Process cells from finest to coarsest LOD to ensure finest wins
-	for lod in range(5):  # LOD 0 through 4
+	for lod in range(5): # LOD 0 through 4
 		for lod0_y in range(lod0_grid.y):
 			for lod0_x in range(lod0_grid.x):
 				var idx = lod0_y * lod0_grid.x + lod0_x
@@ -412,12 +458,12 @@ func _determine_desired_chunks(camera_pos: Vector3) -> Dictionary:
 				# Check if this cell is already covered by a finer LOD
 				var cell_key = "%d_%d" % [lod0_x, lod0_y]
 				if covered_cells.has(cell_key):
-					continue  # Already covered by finer LOD
+					continue # Already covered by finer LOD
 				
 				# Map this cell to its chunk at the chosen LOD
 				var lod_scale = int(pow(2, chosen_lod))
-				var chunk_x = int(lod0_x / lod_scale)
-				var chunk_y = int(lod0_y / lod_scale)
+				var chunk_x = int(float(lod0_x) / float(lod_scale))
+				var chunk_y = int(float(lod0_y) / float(lod_scale))
 				var chunk_key = "lod%d_x%d_y%d" % [chosen_lod, chunk_x, chunk_y]
 				
 				# Add to desired set
@@ -494,7 +540,7 @@ func _verify_no_overlaps(chunks: Dictionary) -> void:
 			var z_overlap = a.min_z < b.max_z and a.max_z > b.min_z
 			
 			if x_overlap and z_overlap:
-				push_error("[OVERLAP] %s (LOD %d) overlaps with %s (LOD %d)" % 
+				push_error("[OVERLAP] %s (LOD %d) overlaps with %s (LOD %d)" %
 					[a.key, a.lod, b.key, b.lod])
 				overlaps_found += 1
 	

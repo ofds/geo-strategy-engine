@@ -47,13 +47,16 @@ func _ready() -> void:
 	if hex_shader:
 		var hex_material = ShaderMaterial.new()
 		hex_material.shader = hex_shader
+		hex_material.render_priority = 1 # Prepare to render on top of terrain
 		
 		# Set initial uniforms from Constants
 		hex_material.set_shader_parameter("hex_size", Constants.HEX_SIZE_M)
 		hex_material.set_shader_parameter("fade_start", Constants.GRID_FADE_START_M)
 		hex_material.set_shader_parameter("fade_end", Constants.GRID_FADE_END_M)
 		
+		
 		shared_terrain_material.next_pass = hex_material
+		print("TerrainLoader: Hex shader loaded and assigned to next_pass. Priority: ", hex_material.render_priority)
 	else:
 		push_error("TerrainLoader: Failed to load hex overlay shader!")
 

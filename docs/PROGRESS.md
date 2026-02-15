@@ -58,6 +58,11 @@ The **Dynamic Chunk Streaming** system is fully operational, now with a **Hex Gr
     *   **Space (Hold)**: Speed Boost.
     *   **Mouse Wheel**: Zoom.
     *   **Middle Mouse**: Orbit.
+    *   **Left Click**: Select Hex (Pop-up).
     *   **F1**: Toggle Hex Grid.
 
-> **Note:** Fixed "x-ray" visual artifact where grid lines from hidden LOD chunks were visible. Shader now uses proper depth testing.
+> **Note:** Fixed hex coordinate offset. Selection now highlights the exact hex under cursor.
+> **Note:** Fixed "x-ray" artifacts by re-enabling depth testing and using a 2.0m vertex offset.
+
+
+
