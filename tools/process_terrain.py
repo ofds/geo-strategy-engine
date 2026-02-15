@@ -20,6 +20,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import numpy as np
@@ -34,11 +35,13 @@ SRTM_MIRRORS = [
 
 # Constants
 SRTM_TILE_SIZE = 3601  # SRTM1: 1 arc-second resolution, 1°×1° tile (AWS data)
-SRTM_RESOLUTION_M = 30  # Approximate meters per pixel at equator (1 arc-second)
+SRTM1_RESOLUTION_M = 30  # Meters per pixel (1 arc-second)
+SRTM3_RESOLUTION_M = 90  # Effective meters per pixel when downsampling SRTM1 by 3×
 SRTM_NODATA = -32768  # SRTM void value
 CHUNK_SIZE_PX = 512
 LOD_LEVELS = 5
 TILE_OVERLAP_PX = 10  # Overlap zone for blending
+SEA_LEVEL_UINT16 = 1000  # Sea level (0m) maps to this in PNG so water is distinguishable
 
 
 class TerrainProcessor:
@@ -50,6 +53,15 @@ class TerrainProcessor:
         self.cache_dir = cache_dir
         self.bbox = region_config['bounding_box']
         self.max_elevation_m = region_config['max_elevation_m']
+        # SRTM3: use SRTM1 tiles, downsample each tile during merge (90m grid, ~5.5GB not 50GB)
+        self.resolution_key = region_config.get('resolution', 'srtm1')
+        self.downsample_3x = (self.resolution_key == 'srtm3')
+        # Force stream merge for large regions when resolution is srtm3 (safety)
+        _lat = int(np.ceil(self.bbox['lat_max'])) - int(np.floor(self.bbox['lat_min']))
+        _lon = int(np.ceil(self.bbox['lon_max'])) - int(np.floor(self.bbox['lon_min']))
+        if (_lat * _lon) > 800 and self.resolution_key == 'srtm3':
+            self.downsample_3x = True
+        self.resolution_m = SRTM3_RESOLUTION_M if self.downsample_3x else SRTM1_RESOLUTION_M
         
         # Ensure directories exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -69,15 +81,18 @@ class TerrainProcessor:
         print(f"\n{'='*80}")
         print(f"GeoStrategy Terrain Processor")
         print(f"Region: {self.region_config['display_name']}")
+        print(f"Resolution: {self.resolution_key} ({self.resolution_m}m) — {'stream merge (one tile at a time)' if self.downsample_3x else 'full load then merge'}")
         print(f"{'='*80}\n")
         
-        # Step 1: Download SRTM tiles
-        print("[1/7] Downloading SRTM tiles...")
-        tiles = self._download_tiles()
-        
-        # Step 2: Merge tiles
-        print("\n[2/7] Merging tiles into master heightmap...")
-        merged = self._merge_tiles(tiles)
+        # Step 1–2: For SRTM3, download+merge in one pass (one tile in RAM at a time). For SRTM1, download then merge.
+        if self.downsample_3x:
+            print("[1/2] Download & merge (90m, one tile at a time)...")
+            merged = self._download_and_merge_srtm3()
+        else:
+            print("[1/7] Downloading SRTM tiles...")
+            tiles = self._download_tiles()
+            print("\n[2/7] Merging tiles into master heightmap...")
+            merged = self._merge_tiles(tiles)
         
         # Step 3: Fill voids
         print("\n[3/7] Filling data voids...")
@@ -98,9 +113,13 @@ class TerrainProcessor:
         print("\n[6/7] Generating LOD levels and chunking...")
         chunks_info = self._generate_lods_and_chunk(normalized)
         
+        # Step 6b: Generate continental overview texture (while master is still in memory)
+        print("\n[6b/7] Generating continental overview texture...")
+        overview_info = self._generate_overview_texture(normalized)
+        
         # Step 7: Generate metadata
         print("\n[7/7] Generating metadata...")
-        self._generate_metadata(normalized.shape, chunks_info)
+        self._generate_metadata(normalized.shape, chunks_info, overview_info)
         
         # Summary
         elapsed = time.time() - start_time
@@ -119,6 +138,44 @@ class TerrainProcessor:
         print(f"Total processing time: {elapsed:.1f} seconds")
         print(f"Output directory: {self.output_dir}")
         print(f"\n{'='*80}\n")
+    
+    def run_overview_only(self) -> None:
+        """Load existing master_heightmap.png, generate overview texture, and update terrain_metadata.json."""
+        master_path = self.output_dir / "master_heightmap.png"
+        if not master_path.exists():
+            print(f"Error: Master heightmap not found: {master_path}")
+            sys.exit(1)
+        print("Loading master heightmap...")
+        # Allow large master heightmaps (e.g. Europe 68k×43k)
+        old_max = getattr(Image, 'MAX_IMAGE_PIXELS', None)
+        try:
+            Image.MAX_IMAGE_PIXELS = None
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                img = Image.open(master_path)
+        finally:
+            if old_max is not None:
+                Image.MAX_IMAGE_PIXELS = old_max
+        master = np.array(img)
+        if master.ndim != 2:
+            master = master[:, :, 0]
+        master = master.astype(np.uint16)
+        print("Generating continental overview texture...")
+        overview_info = self._generate_overview_texture(master)
+        metadata_path = self.output_dir / "terrain_metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            metadata['overview_texture'] = overview_info['overview_texture']
+            metadata['overview_width_px'] = overview_info['overview_width_px']
+            metadata['overview_height_px'] = overview_info['overview_height_px']
+            metadata['overview_world_width_m'] = overview_info['overview_world_width_m']
+            metadata['overview_world_height_m'] = overview_info['overview_world_height_m']
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            print(f"  [OK] Updated: {metadata_path}")
+        else:
+            print("  [WARN] No terrain_metadata.json found; overview texture saved but metadata not updated.")
     
     def _download_tiles(self) -> List[Tuple[int, int, np.ndarray]]:
         """Download all SRTM tiles covering the bounding box."""
@@ -148,6 +205,59 @@ class TerrainProcessor:
         print(f"  From cache: {self.stats['tiles_cached']} tiles")
         
         return tiles
+    
+    def _download_and_merge_srtm3(self) -> np.ndarray:
+        """Download tiles and merge at 90m in one pass. Only one tile in RAM at a time (~5.5GB total)."""
+        lat_min = self.bbox['lat_min']
+        lat_max = self.bbox['lat_max']
+        lon_min = self.bbox['lon_min']
+        lon_max = self.bbox['lon_max']
+        lat_min_i = int(np.floor(lat_min))
+        lat_max_i = int(np.ceil(lat_max))
+        lon_min_i = int(np.floor(lon_min))
+        lon_max_i = int(np.ceil(lon_max))
+        lat_degrees = lat_max - lat_min
+        lon_degrees = lon_max - lon_min
+        
+        px_per_degree = 1200
+        height_px = int(lat_degrees * px_per_degree)
+        width_px = int(lon_degrees * px_per_degree)
+        tile_out_h, tile_out_w = 1201, 1201
+        
+        total_tiles = (lat_max_i - lat_min_i) * (lon_max_i - lon_min_i)
+        print(f"  Output dimensions: {width_px} × {height_px} pixels (90m)")
+        merged = np.zeros((height_px, width_px), dtype=np.int16)
+        
+        current = 0
+        for lat in range(lat_min_i, lat_max_i):
+            for lon in range(lon_min_i, lon_max_i):
+                current += 1
+                if current % 250 == 0 or current == 1:
+                    print(f"  Progress: {current}/{total_tiles} tiles...", flush=True)
+                
+                tile_data = self._get_tile(lat, lon)
+                if tile_data is None:
+                    tile_place = np.zeros((tile_out_h, tile_out_w), dtype=np.int16)
+                else:
+                    tile_place = tile_data[::3, ::3].astype(np.int16)
+                    del tile_data  # free before next tile load
+                
+                y_offset = int((lat_max - (lat + 1)) * px_per_degree)
+                x_offset = int((lon - lon_min) * px_per_degree)
+                y_start = max(0, y_offset)
+                y_end = min(height_px, y_offset + tile_out_h)
+                x_start = max(0, x_offset)
+                x_end = min(width_px, x_offset + tile_out_w)
+                src_y_start = y_start - y_offset
+                src_y_end = src_y_start + (y_end - y_start)
+                src_x_start = x_start - x_offset
+                src_x_end = src_x_start + (x_end - x_start)
+                if src_y_end > src_y_start and src_x_end > src_x_start:
+                    merged[y_start:y_end, x_start:x_end] = tile_place[src_y_start:src_y_end, src_x_start:src_x_end]
+        
+        print(f"  [OK] Merged {total_tiles} tiles")
+        print(f"  Downloaded: {self.stats['tiles_downloaded']}, from cache: {self.stats['tiles_cached']}")
+        return merged
     
     def _get_tile(self, lat: int, lon: int) -> Optional[np.ndarray]:
         """Get a single SRTM tile, from cache or download."""
@@ -222,63 +332,65 @@ class TerrainProcessor:
         return data
     
     def _merge_tiles(self, tiles: List[Tuple[int, int, np.ndarray]]) -> np.ndarray:
-        """Merge SRTM tiles into a single raster covering the bounding box."""
-        # Calculate output dimensions
+        """Merge SRTM tiles into a single raster. For SRTM3, allocate 90m grid and downsample tiles during merge (avoids ~50GB allocation)."""
         lat_min = self.bbox['lat_min']
         lat_max = self.bbox['lat_max']
         lon_min = self.bbox['lon_min']
         lon_max = self.bbox['lon_max']
-        
-        # Calculate dimensions in pixels
-        # Each degree = SRTM_TILE_SIZE pixels (1201 for SRTM3)
         lat_degrees = lat_max - lat_min
         lon_degrees = lon_max - lon_min
-        
-        # Pixels per degree (SRTM3 has 1201 samples per degree)
-        px_per_degree = SRTM_TILE_SIZE - 1  # 1200 pixels span 1 degree (edges overlap)
-        
-        height_px = int(lat_degrees * px_per_degree)
-        width_px = int(lon_degrees * px_per_degree)
-        
-        print(f"  Output dimensions: {width_px} × {height_px} pixels")
-        
-        # Initialize output array
+
+        if self.downsample_3x:
+            # SRTM3: output at 90m — 1200 pixels per degree (never allocate full 30m grid)
+            px_per_degree = 1200  # 90m ≈ 1200 px/degree
+            height_px = int(lat_degrees * px_per_degree)
+            width_px = int(lon_degrees * px_per_degree)
+            tile_out_h, tile_out_w = 1201, 1201  # one degree at 90m: 1201 samples (1 pixel overlap)
+        else:
+            # SRTM1: output at 30m — 3600 pixels per degree
+            px_per_degree = SRTM_TILE_SIZE - 1  # 3600
+            height_px = int(lat_degrees * px_per_degree)
+            width_px = int(lon_degrees * px_per_degree)
+            tile_out_h, tile_out_w = SRTM_TILE_SIZE, SRTM_TILE_SIZE
+
+        print(f"  Output dimensions: {width_px} × {height_px} pixels ({'90m' if self.downsample_3x else '30m'})")
+
         merged = np.zeros((height_px, width_px), dtype=np.int16)
-        
-        # Place each tile
-        for lat, lon, tile_data in tiles:
-            if tile_data is None:
-                # Fill with zeros (sea level)
-                tile_data = np.zeros((SRTM_TILE_SIZE, SRTM_TILE_SIZE), dtype=np.int16)
-            
-            # Calculate position in output array
-            # Note: SRTM Y axis goes from north to south (top to bottom)
-            # Image Y axis also goes top to bottom, so lat is inverted
-            
+
+        total = len(tiles)
+        for i, (lat, lon, tile_data) in enumerate(tiles):
+            if (i + 1) % 250 == 0 or i == 0:
+                print(f"  Merge progress: {i + 1}/{total} tiles...", flush=True)
+            if self.downsample_3x:
+                # Downsample tile before placing: 3601×3601 → 1201×1201 (stride 3)
+                if tile_data is None:
+                    tile_place = np.zeros((tile_out_h, tile_out_w), dtype=np.int16)
+                else:
+                    tile_place = tile_data[::3, ::3].astype(np.int16)  # 1201×1201
+            else:
+                if tile_data is None:
+                    tile_place = np.zeros((SRTM_TILE_SIZE, SRTM_TILE_SIZE), dtype=np.int16)
+                else:
+                    tile_place = tile_data
+
+            # Position in output (Y: north to south)
             y_offset = int((lat_max - (lat + 1)) * px_per_degree)
             x_offset = int((lon - lon_min) * px_per_degree)
-            
-            # Handle edge overlaps: use average of overlapping pixels
-            tile_h, tile_w = tile_data.shape
-            
-            # Determine actual region to copy (may be clipped at edges)
+
             y_start = max(0, y_offset)
-            y_end = min(height_px, y_offset + tile_h)
+            y_end = min(height_px, y_offset + tile_out_h)
             x_start = max(0, x_offset)
-            x_end = min(width_px, x_offset + tile_w)
-            
-            # Source indices
+            x_end = min(width_px, x_offset + tile_out_w)
+
             src_y_start = y_start - y_offset
             src_y_end = src_y_start + (y_end - y_start)
             src_x_start = x_start - x_offset
             src_x_end = src_x_start + (x_end - x_start)
-            
-            # Copy tile data
+
             if src_y_end > src_y_start and src_x_end > src_x_start:
-                merged[y_start:y_end, x_start:x_end] = tile_data[src_y_start:src_y_end, src_x_start:src_x_end]
-        
+                merged[y_start:y_end, x_start:x_end] = tile_place[src_y_start:src_y_end, src_x_start:src_x_end]
+
         print(f"  [OK] Merged {len(tiles)} tiles")
-        
         return merged
     
     def _fill_voids(self, data: np.ndarray) -> np.ndarray:
@@ -377,25 +489,27 @@ class TerrainProcessor:
         return smoothed.astype(np.int16)
     
     def _normalize(self, data: np.ndarray) -> np.ndarray:
-        """Normalize elevation data to uint16 range [0, 65535]."""
-        # Clamp below sea level to 0
+        """Normalize elevation data to uint16. Sea level (0m) maps to SEA_LEVEL_UINT16 for water detection."""
+        # Clamp below sea level to 0 (missing/ocean tiles already 0)
         data = np.maximum(data, 0)
         
-        # Linear mapping: pixel = elevation_m / max_elevation_m * 65535
-        normalized = (data.astype(np.float32) / self.max_elevation_m * 65535.0)
+        # Map 0m -> SEA_LEVEL_UINT16, max_elevation_m -> 65535 so ocean is low but non-zero
+        scale = (65535.0 - SEA_LEVEL_UINT16) / float(self.max_elevation_m)
+        normalized = (data.astype(np.float32) * scale + SEA_LEVEL_UINT16)
         normalized = np.clip(normalized, 0, 65535).astype(np.uint16)
         
         print(f"  Min elevation: {np.min(data)}m")
         print(f"  Max elevation: {np.max(data)}m")
-        print(f"  Normalized range: {np.min(normalized)} - {np.max(normalized)}")
+        print(f"  Normalized range: {np.min(normalized)} - {np.max(normalized)} (sea level -> {SEA_LEVEL_UINT16})")
         
         return normalized
     
     def _save_png_16bit(self, data: np.ndarray, path: Path) -> None:
         """Save uint16 array as 16-bit grayscale PNG."""
-        # PIL requires mode 'I;16' for 16-bit grayscale
-        # Must ensure data is uint16 and in correct byte order
-        img = Image.fromarray(data, mode='I;16')
+        # PIL 16-bit grayscale (mode 'I;16'); suppress Pillow 13 deprecation for mode=
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            img = Image.fromarray(data, mode='I;16')
         img.save(path)
     
     def _generate_lods_and_chunk(self, master: np.ndarray) -> List[Dict]:
@@ -479,12 +593,115 @@ class TerrainProcessor:
         
         return downsampled
     
-    def _generate_metadata(self, master_shape: Tuple[int, int], chunks_info: List[Dict]) -> None:
+    def _generate_overview_texture(self, master: np.ndarray) -> Optional[Dict]:
+        """Generate a continental overview RGB texture from the master heightmap.
+        Replicates terrain shader elevation coloring (water, green valleys, rock, snow).
+        Returns overview info dict for metadata, or None if skipped.
+        """
+        master_height, master_width = master.shape
+        overview_width = 4096
+        aspect = master_height / float(master_width)
+        overview_height = int(round(overview_width * aspect))
+        
+        # Stride-sample the master heightmap to overview size
+        step_x = master_width / float(overview_width)
+        step_y = master_height / float(overview_height)
+        indices_x = np.minimum(
+            np.round(np.arange(overview_width) * step_x).astype(int),
+            master_width - 1
+        )
+        indices_y = np.minimum(
+            np.round(np.arange(overview_height) * step_y).astype(int),
+            master_height - 1
+        )
+        overview_elev = master[np.ix_(indices_y, indices_x)].astype(np.float32)
+        
+        # Convert uint16 to meters (same formula as terrain_loader.gd)
+        elev_m = (overview_elev - SEA_LEVEL_UINT16) / (65535.0 - SEA_LEVEL_UINT16) * self.max_elevation_m
+        elev_m = np.clip(elev_m, 0.0, float(self.max_elevation_m))
+        
+        # World dimensions (same as chunk grid) for metadata
+        grid_w = (master_width + CHUNK_SIZE_PX - 1) // CHUNK_SIZE_PX
+        grid_h = (master_height + CHUNK_SIZE_PX - 1) // CHUNK_SIZE_PX
+        overview_world_width_m = grid_w * CHUNK_SIZE_PX * self.resolution_m
+        overview_world_height_m = grid_h * CHUNK_SIZE_PX * self.resolution_m
+
+        # Elevation zone colors (RGB 0-255) matching terrain.gdshader
+        COLOR_WATER = (38, 64, 115)
+        COLOR_COASTAL_LOW = (41, 74, 28)   # 0-50m slightly darker
+        COLOR_PLAINS = (46, 82, 31)        # 50-150m standard = COLOR_LOWLAND
+        COLOR_LOW_HILLS = (51, 87, 33)     # 150-300m slightly lighter
+        COLOR_LOWLAND = (46, 82, 31)       # <300m
+        COLOR_FOOTHILLS = (64, 107, 38)   # 300-800m
+        COLOR_ALPINE = (89, 122, 46)       # 800-1500m
+        COLOR_ROCK = (115, 97, 77)         # 1500-2200m
+        COLOR_HIGH_ROCK = (158, 153, 148)  # 2200-3000m
+        COLOR_SNOW = (235, 237, 242)       # >3000m
+        TRANSITION_M = 200.0
+        LOW_ELEV_BLEND_M = 50.0
+
+        def blend_t(boundary: float, e: np.ndarray) -> np.ndarray:
+            t = (e - (boundary - TRANSITION_M)) / (2.0 * TRANSITION_M)
+            return np.clip(t, 0.0, 1.0)
+
+        def blend_low(boundary: float, e: np.ndarray) -> np.ndarray:
+            t = (e - (boundary - LOW_ELEV_BLEND_M)) / (2.0 * LOW_ELEV_BLEND_M)
+            return np.clip(t, 0.0, 1.0)
+
+        rgb = np.zeros((overview_height, overview_width, 3), dtype=np.uint8)
+        water_mask = elev_m < 5  # Match shader WATER_ELEVATION_M = 5.0
+        rgb[water_mask] = COLOR_WATER
+
+        land = ~water_mask
+        # Low-elev micro-detail (0-50, 50-150, 150-300) then blend to standard bands at 200-400m
+        t50 = blend_low(50.0, elev_m)
+        t150 = blend_low(150.0, elev_m)
+        t300 = blend_t(300.0, elev_m)
+        t800 = blend_t(800.0, elev_m)
+        t1500 = blend_t(1500.0, elev_m)
+        t2200 = blend_t(2200.0, elev_m)
+        t3000 = blend_t(3000.0, elev_m)
+        low_elev_blend = np.clip((elev_m - 200.0) / 200.0, 0.0, 1.0)  # 200-400m blend to standard
+
+        for c in range(3):
+            c_coast = np.where(land, np.float32(COLOR_COASTAL_LOW[c]), 0.0)
+            c_plains = np.where(land, np.float32(COLOR_PLAINS[c]), 0.0)
+            c_lowh = np.where(land, np.float32(COLOR_LOW_HILLS[c]), 0.0)
+            c_low = np.where(land, np.float32(COLOR_LOWLAND[c]), 0.0)
+            c_foot = np.where(land, np.float32(COLOR_FOOTHILLS[c]), 0.0)
+            c_alp = np.where(land, np.float32(COLOR_ALPINE[c]), 0.0)
+            c_rock = np.where(land, np.float32(COLOR_ROCK[c]), 0.0)
+            c_high = np.where(land, np.float32(COLOR_HIGH_ROCK[c]), 0.0)
+            c_snow = np.where(land, np.float32(COLOR_SNOW[c]), 0.0)
+            low_band = c_coast * (1 - t50) + c_plains * t50
+            low_band = low_band * (1 - t150) + c_lowh * t150
+            out_c = low_band * (1 - low_elev_blend) + c_low * low_elev_blend
+            out_c = out_c * (1 - t300) + c_foot * t300
+            out_c = out_c * (1 - t800) + c_alp * t800
+            out_c = out_c * (1 - t1500) + c_rock * t1500
+            out_c = out_c * (1 - t2200) + c_high * t2200
+            out_c = out_c * (1 - t3000) + c_snow * t3000
+            rgb[land, c] = np.clip(np.round(out_c[land]), 0, 255).astype(np.uint8)
+
+        out_path = self.output_dir / "overview_texture.png"
+        img = Image.fromarray(rgb)
+        img.save(out_path)
+
+        print(f"  [OK] Saved: {out_path} ({overview_width}×{overview_height})")
+        return {
+            'overview_texture': 'overview_texture.png',
+            'overview_width_px': overview_width,
+            'overview_height_px': overview_height,
+            'overview_world_width_m': int(overview_world_width_m),
+            'overview_world_height_m': int(overview_world_height_m),
+        }
+    
+    def _generate_metadata(self, master_shape: Tuple[int, int], chunks_info: List[Dict], overview_info: Optional[Dict] = None) -> None:
         """Generate terrain_metadata.json."""
         metadata = {
             'region_name': self.region_config['display_name'],
             'bounding_box': self.bbox,
-            'resolution_m': SRTM_RESOLUTION_M,
+            'resolution_m': self.resolution_m,
             'max_elevation_m': self.max_elevation_m,
             'chunk_size_px': CHUNK_SIZE_PX,
             'lod_levels': LOD_LEVELS,
@@ -493,6 +710,12 @@ class TerrainProcessor:
             'master_heightmap_height': master_shape[0],
             'chunks': chunks_info,
         }
+        if overview_info:
+            metadata['overview_texture'] = overview_info['overview_texture']
+            metadata['overview_width_px'] = overview_info['overview_width_px']
+            metadata['overview_height_px'] = overview_info['overview_height_px']
+            metadata['overview_world_width_m'] = overview_info['overview_world_width_m']
+            metadata['overview_world_height_m'] = overview_info['overview_world_height_m']
         
         metadata_path = self.output_dir / "terrain_metadata.json"
         with open(metadata_path, 'w') as f:
@@ -536,6 +759,12 @@ def main():
         help='Cache directory for downloaded SRTM tiles (default: ./cache/)',
     )
     
+    parser.add_argument(
+        '--overview-only',
+        action='store_true',
+        help='Only generate overview texture from existing master_heightmap.png and update metadata (skip download/merge/chunk).',
+    )
+    
     args = parser.parse_args()
     
     # Load regions config
@@ -558,7 +787,10 @@ def main():
     processor = TerrainProcessor(region_config, args.output, args.cache)
     
     try:
-        processor.run()
+        if args.overview_only:
+            processor.run_overview_only()
+        else:
+            processor.run()
     except KeyboardInterrupt:
         print("\n\nProcessing interrupted by user.")
         sys.exit(1)

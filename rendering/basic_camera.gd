@@ -24,6 +24,9 @@ var orbit_sensitivity: float = 0.3 # Increased from 0.2 - more responsive orbit
 # Debug
 var debug_collision: bool = false # Set to true to see collision debug info
 var frame_count: int = 0
+# Height pipeline diagnostic: when true, print [SHADER] altitude/overview_blend once per second (enable with ChunkManager DEBUG_DIAGNOSTIC for full pipeline)
+@export var DEBUG_DIAGNOSTIC: bool = false
+var _shader_diag_timer: float = 0.0
 
 # Speed boost
 var speed_boost_multiplier: float = 10.0 # 10x speed when Space is held
@@ -32,9 +35,14 @@ var is_speed_boost_active: bool = false
 # Mouse state
 var is_orbiting: bool = false
 var last_mouse_pos: Vector2 = Vector2.ZERO
+# Throttle hover raycast to every 3rd frame to reduce per-frame cost
+var _hover_raycast_frame: int = 0
 
 # Terrain chunk reference (for initial positioning)
 var chunk_size_m: float = 15360.0 # 512 px × 30 m = 15.36 km
+# Region bounds (for edge fade in shader)
+var _terrain_center_xz: Vector2 = Vector2.ZERO
+var _terrain_radius_m: float = 2000000.0 # half-diagonal of region
 
 # Terrain height reference
 var terrain_min_elevation: float = 0.0
@@ -42,27 +50,62 @@ var terrain_max_elevation: float = 5000.0
 var min_camera_clearance: float = 100.0 # Stay at least 100m above terrain
 
 
+func _load_terrain_metadata() -> Dictionary:
+	var path = "res://data/terrain/terrain_metadata.json"
+	if not FileAccess.file_exists(path):
+		return {}
+	var f = FileAccess.open(path, FileAccess.READ)
+	if not f:
+		return {}
+	var json = JSON.new()
+	if json.parse(f.get_as_text()) != OK:
+		f.close()
+		return {}
+	f.close()
+	return json.data
+
+
 func _ready() -> void:
-	# Ensure camera can see very far for large terrain
-	far = 500000.0 # 500km view distance (very large for complete coverage)
+	# Continental scale: 2000 km far plane, fog extended in shader
+	far = 2000000.0 # 2000 km for full Europe view
 	near = 10.0 # Prevent clipping when very close to terrain
 	
-	# Position camera above center of terrain (chunk 15, 8 at LOD 0)
-	# Each LOD 0 chunk is 15,360m wide (512 px × 30 m)
-	var local_chunk_size_m: float = 15360.0
+	# Center camera on terrain from metadata (Europe ~50°N, 15°E; Alps fallback)
+	var meta = _load_terrain_metadata()
+	var res_m: float = meta.get("resolution_m", 90.0)
+	chunk_size_m = 512.0 * res_m
 	
-	# Calculate center of terrain in world space
-	var center_chunk_x: float = 15.0
-	var center_chunk_y: float = 8.0
-	var grid_center_world_x: float = (center_chunk_x + 0.5) * local_chunk_size_m
-	var grid_center_world_z: float = (center_chunk_y + 0.5) * local_chunk_size_m
+	var grid_center_world_x: float = 0.0
+	var grid_center_world_z: float = 0.0
+	if meta.has("bounding_box") and meta.has("master_heightmap_width") and meta.has("master_heightmap_height"):
+		var bb = meta.bounding_box
+		var lat_min: float = bb.lat_min
+		var lat_max: float = bb.lat_max
+		var lon_min: float = bb.lon_min
+		var lon_max: float = bb.lon_max
+		var mw: int = meta.master_heightmap_width
+		var mh: int = meta.master_heightmap_height
+		var width_m: float = float(mw) * res_m
+		var height_m: float = float(mh) * res_m
+		var center_lat: float = (lat_min + lat_max) * 0.5
+		var center_lon: float = (lon_min + lon_max) * 0.5
+		# World X = east, Z = south; origin at NW corner
+		grid_center_world_x = (center_lon - lon_min) / (lon_max - lon_min) * width_m
+		grid_center_world_z = (lat_max - center_lat) / (lat_max - lat_min) * height_m
+		_terrain_center_xz = Vector2(grid_center_world_x, grid_center_world_z)
+		_terrain_radius_m = sqrt((width_m * 0.5) * (width_m * 0.5) + (height_m * 0.5) * (height_m * 0.5))
+	else:
+		# Fallback: Alps-style center
+		grid_center_world_x = 15.5 * chunk_size_m
+		grid_center_world_z = 8.5 * chunk_size_m
+		_terrain_center_xz = Vector2(grid_center_world_x, grid_center_world_z)
+		_terrain_radius_m = 500000.0 # fallback for small region
 	
-	target_position = Vector3(grid_center_world_x, 1000, grid_center_world_z) # Look at 1km elevation
-	
-	# Start at 50km altitude to see LOD rings clearly
-	orbit_distance = 50000.0 # 50km altitude
-	target_orbit_distance = 50000.0
-	orbit_pitch = 70.0 # Steep angle for top-down view
+	target_position = Vector3(grid_center_world_x, 1000.0, grid_center_world_z)
+	# Start altitude: ~150 km for Europe so a large area is visible
+	orbit_distance = 150000.0
+	target_orbit_distance = 150000.0
+	orbit_pitch = 70.0
 	orbit_yaw = 45.0
 	
 	_update_camera_transform()
@@ -70,10 +113,7 @@ func _ready() -> void:
 	print("\n=== Camera initialized for multi-LOD view ===")
 	print("Target: %s" % target_position)
 	print("Distance: %.1f m (%.1f km)" % [orbit_distance, orbit_distance / 1000.0])
-	print("Pitch: %.1f°" % orbit_pitch)
-	print("Camera position: %s" % position)
-	print("Camera far plane: %.1f m" % far)
-	print("View optimized for seeing LOD rings across large terrain")
+	print("Camera far plane: %.1f km" % (far / 1000.0))
 
 
 func _input(event: InputEvent) -> void:
@@ -94,7 +134,8 @@ func _input(event: InputEvent) -> void:
 			
 		# Mouse Click - Hex Selection
 		elif event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
-			print("DEBUG: Left Click Detected at ", event.position)
+			if DEBUG_DIAGNOSTIC:
+				print("DEBUG: Left Click Detected at ", event.position)
 			_handle_hex_selection_click(event.position)
 	
 	# Mouse motion - orbit when middle button held
@@ -111,52 +152,57 @@ func _input(event: InputEvent) -> void:
 			
 			_update_camera_transform()
 func _handle_hex_selection_click(screen_pos: Vector2) -> void:
-	# Raycast to find clicked hex
 	var space_state = get_world_3d().direct_space_state
 	var ray_origin = project_ray_origin(screen_pos)
 	var ray_end = ray_origin + project_ray_normal(screen_pos) * 500000.0
-	
+
 	var query = PhysicsRayQueryParameters3D.create(ray_origin, ray_end)
 	query.collision_mask = 1
 	var result = space_state.intersect_ray(query)
-	
+
 	if result:
 		var hit_pos = result.position
-		
-		# Convert to hex
+
+		# Only allow selection on LOD 0–2 terrain; LOD 3+ is too coarse for hex visual
+		var chunk_mgr = get_parent().get_node_or_null("ChunkManager")
+		if chunk_mgr and chunk_mgr.has_method("get_lod_at_world_position"):
+			var hit_lod = chunk_mgr.get_lod_at_world_position(hit_pos)
+			if hit_lod >= 3:
+				_show_zoom_in_to_select_message()
+				return
+			_clear_zoom_in_message()
+
 		var width = Constants.HEX_SIZE_M
 		var hex_size = width / sqrt(3.0)
-		
+
 		var q = (2.0 / 3.0 * hit_pos.x) / hex_size
 		var r = (-1.0 / 3.0 * hit_pos.x + sqrt(3.0) / 3.0 * hit_pos.z) / hex_size
-		
+
 		var hex_axial = _axial_round(Vector2(q, r))
 		var hex_q = int(hex_axial.x)
 		var hex_r = int(hex_axial.y)
-		
-		# Calculate Center
+
 		var center_x = hex_size * (3.0 / 2.0 * hex_q)
 		var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
 		var center = Vector2(center_x, center_z)
-		
-		print("DEBUG: Clicked Hex (%d, %d) Center: %s" % [hex_q, hex_r, center])
-		
-		# Toggle selection
+
+		var hex_selector = get_parent().get_node_or_null("HexSelector")
 		if _selected_hex_center.distance_to(center) < 1.0:
-			# Deselect if clicking same hex (instant, no fade-out)
-			print("DEBUG: Deselecting")
 			_selected_hex_center = Vector2(999999, 999999)
+			if hex_selector and hex_selector.has_method("clear_selection"):
+				hex_selector.clear_selection()
 		else:
-			# Select new hex — reset animation timer
-			print("DEBUG: Selecting new hex")
 			_selected_hex_center = center
 			_selection_time = 0.0
+			if hex_selector and hex_selector.has_method("set_selected_hex"):
+				hex_selector.set_selected_hex(center)
 	else:
-		# Clicked sky/nothing -> Deselect
-		print("DEBUG: Clicked Sky -> Deselecting")
 		_selected_hex_center = Vector2(999999, 999999)
-	
-	# Update Shader immediately
+		_clear_zoom_in_message()
+		var hex_sel = get_parent().get_node_or_null("HexSelector")
+		if hex_sel and hex_sel.has_method("clear_selection"):
+			hex_sel.clear_selection()
+
 	_update_hex_selection_uniform()
 
 
@@ -199,44 +245,48 @@ var _selected_hex_center: Vector2 = Vector2(999999, 999999)
 var _selection_time: float = 0.0 # Seconds since selection; animates lift/border/tint
 
 func _update_hex_selection_uniform() -> void:
-	# ... existing code ...
-	# Find material (reusing logic from _update_hex_grid_interaction or caching it would be better)
-	# For now, quick lookup same as before
-	var terrain_material: ShaderMaterial = null
-	var chunk = get_tree().get_first_node_in_group("terrain_chunks")
-	if chunk and chunk is MeshInstance3D:
-		var mat = chunk.get_surface_override_material(0)
-		# UNIFIED SHADER FLIP: The material IS the ShaderMaterial now, not next_pass
-		if mat is ShaderMaterial:
-			terrain_material = mat
-	
-	# Fallback search
-	if not terrain_material:
-		var root = get_tree().root
-		if root:
-			var node = _find_chunk_recursive(root)
-			if node:
-				var mat = node.get_surface_override_material(0)
-				if mat is ShaderMaterial:
-					terrain_material = mat
-	
-	if terrain_material:
-		terrain_material.set_shader_parameter("selected_hex_center", _selected_hex_center)
-		terrain_material.set_shader_parameter("selection_time", _selection_time)
-	else:
-		print("DEBUG: Could not find terrain material to update selection!")
+	var hex_mat = _get_hex_overlay_material()
+	if hex_mat:
+		hex_mat.set_shader_parameter("selected_hex_center", _selected_hex_center)
+		hex_mat.set_shader_parameter("selection_time", _selection_time)
+	elif DEBUG_DIAGNOSTIC:
+		print("DEBUG: Could not find hex overlay material to update selection!")
 
 
 func _process(delta: float) -> void:
 	# Check for speed boost (Space key)
 	is_speed_boost_active = Input.is_key_pressed(KEY_SPACE)
-	
+
 	# Animate selection (lift/border/tint fade-in)
 	if _selected_hex_center.x < 900000.0: # Has selection (not sentinel)
 		_selection_time += delta
+
+	if _zoom_in_label_timer > 0.0:
+		_zoom_in_label_timer -= delta
+		if _zoom_in_label_timer <= 0.0 and _zoom_in_label:
+			_zoom_in_label.visible = false
 	
+	# Stage 5 diagnostic: altitude and overview_blend once per second (DEBUG_DIAGNOSTIC)
+	if DEBUG_DIAGNOSTIC:
+		_shader_diag_timer += delta
+		if _shader_diag_timer >= 1.0:
+			_shader_diag_timer = 0.0
+			var alt: float = orbit_distance if orbit_distance > 0.0 else position.y
+			# Same formula as shader: smoothstep(15000.0, 180000.0, altitude)
+			var t: float = clampf((alt - 15000.0) / (180000.0 - 15000.0), 0.0, 1.0)
+			var overview_blend: float = t * t * (3.0 - 2.0 * t)
+			print("[SHADER] altitude=%.1f overview_blend=%.3f" % [alt, overview_blend])
+			if alt < 15000.0 and overview_blend < 0.01:
+				print("[VERIFY] At 5km altitude: overview_blend=0.0, mesh color active")
+
 	# Smoothly interpolate orbit_distance toward target
 	orbit_distance = lerp(orbit_distance, target_orbit_distance, zoom_smoothing * delta)
+	
+	# Dynamic far plane: 10,000 km at high altitude to avoid z-fighting; 2,000 km at lower altitude
+	if orbit_distance > 1000000.0:
+		far = 10000000.0
+	else:
+		far = 2000000.0
 	
 	# WASD panning
 	var pan_input = Vector2.ZERO
@@ -292,10 +342,9 @@ func _pan(direction: Vector2, delta: float) -> void:
 
 func _zoom(direction: int) -> void:
 	"""Zoom in (direction < 0) or out (direction > 0)."""
-	
-	# Zoom amount should be a percentage of current distance
-	# This keeps zoom speed proportional at all distances
-	var zoom_factor = 0.15 # 15% per scroll
+	# Percentage-based zoom: ~15% per scroll keeps feel proportional from 1 km to 5,000 km
+	# (e.g. 10 km → ~1.5 km/step; 1,000 km → ~150 km/step; 3,000 km → ~450 km/step)
+	var zoom_factor = 0.15
 	
 	# Calculate new target distance
 	if direction < 0:
@@ -306,9 +355,8 @@ func _zoom(direction: int) -> void:
 		target_orbit_distance *= (1.0 + zoom_factor)
 	
 	# Clamp distance to reasonable range
-	# Min: 500m (close to terrain)
-	# Max: 150km (far enough to see entire region)
-	target_orbit_distance = clamp(target_orbit_distance, 500.0, 150000.0)
+	# Min: 500m (close to terrain); Max: 5,000km (full continental view, e.g. all of Europe)
+	target_orbit_distance = clamp(target_orbit_distance, 500.0, 5000000.0)
 
 
 func _update_camera_transform() -> void:
@@ -371,46 +419,76 @@ func _update_camera_transform() -> void:
 	_update_hex_grid_interaction()
 
 
-func _update_hex_grid_interaction() -> void:
-	# 1. Update Altitude Uniform
-	# The terrain material is shared, so we can access it from any chunk or via the customized TerrainLoader if we had a reference.
-	# But better: access via the tree or a known global.
-	# Since we don't have a direct reference to the terrain material here, we need to find it.
-	# In this demo setup, the chunks are children of the scene root or a manager.
-	# We can try to get the material from a chunk if one exists, or rely on a global singleton if it existed.
-	# A robust way: The camera doesn't usually manage terrain materials.
-	# However, for this task, we need to pass the uniforms.
-	# We can find a MeshInstance3D that is a chunk and get its material.
-	# Or, improved: TerrainLoader sets the material on the chunks.
-	# Let's assume we can get it from the first MeshInstance3D we find in the "Terrain" group or similar.
-	# For now, let's look for a chunk in the scene tree.
-	var terrain_material: ShaderMaterial = null
+func _get_terrain_material() -> ShaderMaterial:
 	var chunk = get_tree().get_first_node_in_group("terrain_chunks")
 	if chunk and chunk is MeshInstance3D:
 		var mat = chunk.get_surface_override_material(0)
 		if mat is ShaderMaterial:
-			terrain_material = mat
-	
-	# fallback: try to find by name pattern if group not set
-	if not terrain_material:
-		var root = get_tree().root
-		if root:
-			var node = _find_chunk_recursive(root)
-			if node:
-				var mat = node.get_surface_override_material(0)
-				if mat is ShaderMaterial:
-					terrain_material = mat
-	
-	if terrain_material:
-		# Update Altitude
-		terrain_material.set_shader_parameter("altitude", position.y)
-		# Fog: pass camera position to shader
+			return mat
+	var root = get_tree().root
+	if root:
+		var node = _find_chunk_recursive(root)
+		if node:
+			var mat = node.get_surface_override_material(0)
+			if mat is ShaderMaterial:
+				return mat
+	return null
+
+
+func _get_hex_overlay_material() -> ShaderMaterial:
+	# Prefer TerrainLoader's LOD 0-1 material (has next_pass) so hex params always apply.
+	var loader = get_tree().get_first_node_in_group("terrain_loader")
+	if loader and loader is TerrainLoader:
+		var with_overlay: Material = loader.shared_terrain_material
+		if with_overlay and with_overlay is ShaderMaterial and (with_overlay as ShaderMaterial).next_pass is ShaderMaterial:
+			return (with_overlay as ShaderMaterial).next_pass
+	var terrain_mat = _get_terrain_material()
+	if terrain_mat and terrain_mat.next_pass is ShaderMaterial:
+		return terrain_mat.next_pass
+	return null
+
+
+func _update_hex_grid_interaction() -> void:
+	var alt_uniform: float = orbit_distance if orbit_distance > 0.0 else position.y
+	var terrain_materials: Array[ShaderMaterial] = []
+	var hex_mat: ShaderMaterial = _get_hex_overlay_material()
+
+	# When using two-materials fallback, update both terrain materials (LOD 0-1 and LOD 2+).
+	var loader = get_tree().get_first_node_in_group("terrain_loader")
+	if loader and loader is TerrainLoader:
+		if loader.shared_terrain_material is ShaderMaterial:
+			terrain_materials.append(loader.shared_terrain_material as ShaderMaterial)
+		if loader.shared_terrain_material_lod2plus is ShaderMaterial:
+			terrain_materials.append(loader.shared_terrain_material_lod2plus as ShaderMaterial)
+	if terrain_materials.is_empty():
+		var single = _get_terrain_material()
+		if single:
+			terrain_materials.append(single)
+
+	# [HEX] first-frame diagnostic (DEBUG_DIAGNOSTIC only)
+	if DEBUG_DIAGNOSTIC and not _hex_diag_printed and hex_mat:
+		_hex_diag_printed = true
+		var show_val = hex_mat.get_shader_parameter("show_grid")
+		var hover_val = hex_mat.get_shader_parameter("hovered_hex_center")
+		print("[HEX] Frame update: altitude=%.1f show_grid=%s hovered_hex_center=%s" % [alt_uniform, show_val, hover_val])
+
+	for terrain_material in terrain_materials:
+		terrain_material.set_shader_parameter("altitude", alt_uniform)
 		terrain_material.set_shader_parameter("camera_position", position)
-		# Selection animation time (incremented in _process when selected)
-		terrain_material.set_shader_parameter("selection_time", _selection_time)
-		terrain_material.set_shader_parameter("selected_hex_center", _selected_hex_center)
-		
-		# Selection info label (inspection: show selected hex coords)
+		terrain_material.set_shader_parameter("terrain_center_xz", _terrain_center_xz)
+		terrain_material.set_shader_parameter("terrain_radius_m", _terrain_radius_m)
+
+	if hex_mat:
+		hex_mat.set_shader_parameter("altitude", alt_uniform)
+		hex_mat.set_shader_parameter("camera_position", position)
+		hex_mat.set_shader_parameter("selection_time", _selection_time)
+		hex_mat.set_shader_parameter("selected_hex_center", _selected_hex_center)
+
+	var overview_node = get_tree().get_first_node_in_group("overview_plane")
+	if overview_node and overview_node is MeshInstance3D:
+		_hover_raycast_frame += 1
+		var do_raycast = (_hover_raycast_frame % 3 == 0)
+
 		if _selected_hex_center.x < 900000.0:
 			var width = Constants.HEX_SIZE_M
 			var size_axial = width / sqrt(3.0)
@@ -420,63 +498,41 @@ func _update_hex_grid_interaction() -> void:
 			_update_selection_label(int(sel_axial.x), int(sel_axial.y))
 		else:
 			_hide_selection_label()
-		
-		# Update Hovered Hex
-		var mouse_pos = get_viewport().get_mouse_position()
-		var space_state = get_world_3d().direct_space_state
-		var ray_origin = project_ray_origin(mouse_pos)
-		var ray_end = ray_origin + project_ray_normal(mouse_pos) * 500000.0 # Long ray
-		
-		# Raycast to terrain (mask 1)
-		var query = PhysicsRayQueryParameters3D.create(ray_origin, ray_end)
-		query.collision_mask = 1
-		var result = space_state.intersect_ray(query)
-		
-		if result:
-			var hit_pos = result.position
-			
-			# Convert hit_pos to Hex Coordinates
-			# Flat-top hex math (matching shader exactly)
-			# Width (flat-to-flat) = HEX_SIZE_M (1000.0)
-			# Size (center-to-corner) = Width / sqrt(3)
-			var width = Constants.HEX_SIZE_M
-			var hex_size = width / sqrt(3.0)
-			
-			# Axial coordinates (q, r)
-			# q = (2/3 * x) / size
-			# r = (-1/3 * x + sqrt(3)/3 * z) / size
-			var q = (2.0 / 3.0 * hit_pos.x) / hex_size
-			var r = (-1.0 / 3.0 * hit_pos.x + sqrt(3.0) / 3.0 * hit_pos.z) / hex_size
-			
-			# Round to nearest hex
-			var hex_axial = _axial_round(Vector2(q, r))
-			var hex_q = int(hex_axial.x)
-			var hex_r = int(hex_axial.y)
-			
-			# Calculate World Center of hit hex
-			# x = size * (3/2 * q)
-			# z = size * (sqrt(3)/2 * q + sqrt(3) * r)
-			var center_x = hex_size * (3.0 / 2.0 * hex_q)
-			var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
-			
-			# Pass to Shader
-			if terrain_material:
-				terrain_material.set_shader_parameter("hovered_hex_center", Vector2(center_x, center_z))
-			
-			# Debug Visuals
-			_update_debug_visuals(hit_pos, Vector3(center_x, hit_pos.y, center_z))
-			
-			# Show Debug Label
-			_update_debug_label(hex_q, hex_r)
-		else:
-			# No hit
-			_hide_debug_label()
-			
-		# Toggle Visibility F1
+
+		if do_raycast:
+			var mouse_pos = get_viewport().get_mouse_position()
+			var space_state = get_world_3d().direct_space_state
+			var ray_origin = project_ray_origin(mouse_pos)
+			var ray_end = ray_origin + project_ray_normal(mouse_pos) * 500000.0
+			var query = PhysicsRayQueryParameters3D.create(ray_origin, ray_end)
+			query.collision_mask = 1
+			var result = space_state.intersect_ray(query)
+
+			if result:
+				var hit_pos = result.position
+				var width = Constants.HEX_SIZE_M
+				var hex_size = width / sqrt(3.0)
+				var q = (2.0 / 3.0 * hit_pos.x) / hex_size
+				var r = (-1.0 / 3.0 * hit_pos.x + sqrt(3.0) / 3.0 * hit_pos.z) / hex_size
+				var hex_axial = _axial_round(Vector2(q, r))
+				var hex_q = int(hex_axial.x)
+				var hex_r = int(hex_axial.y)
+				var center_x = hex_size * (3.0 / 2.0 * hex_q)
+				var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
+				if hex_mat:
+					hex_mat.set_shader_parameter("hovered_hex_center", Vector2(center_x, center_z))
+				_update_debug_visuals(hit_pos, Vector3(center_x, hit_pos.y, center_z))
+				_update_debug_label(hex_q, hex_r)
+			else:
+				_hide_debug_label()
+				if hex_mat:
+					hex_mat.set_shader_parameter("hovered_hex_center", Vector2(999999.0, 999999.0))
+
 		if Input.is_key_pressed(KEY_F1):
 			if not _f1_pressed_last_frame:
 				_grid_visible = not _grid_visible
-				terrain_material.set_shader_parameter("show_grid", _grid_visible)
+				if hex_mat:
+					hex_mat.set_shader_parameter("show_grid", _grid_visible)
 				_f1_pressed_last_frame = true
 		else:
 			_f1_pressed_last_frame = false
@@ -486,6 +542,7 @@ var _grid_visible: bool = true
 var _f1_pressed_last_frame: bool = false
 var _debug_label: Label = null
 var _selection_label: Label = null
+var _hex_diag_printed: bool = false
 
 
 func _find_chunk_recursive(node: Node) -> MeshInstance3D:
@@ -552,3 +609,23 @@ func _update_selection_label(q: int, r: int) -> void:
 func _hide_selection_label() -> void:
 	if _selection_label:
 		_selection_label.visible = false
+
+
+var _zoom_in_label: Label = null
+var _zoom_in_label_timer: float = 0.0
+
+func _show_zoom_in_to_select_message() -> void:
+	if not _zoom_in_label:
+		_zoom_in_label = Label.new()
+		_zoom_in_label.position = Vector2(20, 84)
+		_zoom_in_label.add_theme_font_size_override("font_size", 18)
+		_zoom_in_label.add_theme_color_override("font_color", Color(0.9, 0.75, 0.3))
+		add_child(_zoom_in_label)
+	_zoom_in_label.text = "Zoom in to select a hex"
+	_zoom_in_label.visible = true
+	_zoom_in_label_timer = 3.0
+
+func _clear_zoom_in_message() -> void:
+	if _zoom_in_label:
+		_zoom_in_label.visible = false
+	_zoom_in_label_timer = 0.0

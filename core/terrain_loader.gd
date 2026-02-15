@@ -4,6 +4,8 @@ extends Node
 ## CRITICAL: Properly handles 16-bit PNG elevation data
 ## Called by ChunkManager to generate individual chunk meshes
 
+const _TerrainWorkerScript = preload("res://core/terrain_worker.gd")
+
 # Metadata from terrain_metadata.json
 var terrain_metadata: Dictionary = {}
 var max_elevation_m: float = 4810.0
@@ -19,16 +21,22 @@ const LOD_MESH_RESOLUTION: Array[int] = [
 	32, # LOD 4: 1/256 detail (32×32 = 1k vertices)
 ]
 
-# SHARED MATERIAL: One material for all chunks to enable draw call batching
+# SHARED MATERIALS: LOD 0-1 use overlay (hex grid); LOD 2+ use same terrain without overlay to reduce doubling.
 var shared_terrain_material: Material = null
+var shared_terrain_material_lod2plus: Material = null
 
 # Height data cache: path -> heights array. FIFO, max 100 entries.
 const HEIGHT_CACHE_MAX: int = 100
 var _height_cache: Dictionary = {}
 var _height_cache_order: Array = []
 
+# Phase B micro-steps: MESH -> SCENE -> COLLISION (each step can run on a different frame)
+enum PhaseBStep { MESH, SCENE, COLLISION }
+
 # Timing instrumentation: set true in Inspector (or here) for [TIME] per-chunk breakdown
 @export var DEBUG_CHUNK_TIMING: bool = false
+# Hex overlay diagnostics: when true, print [HEX] shader/material/next_pass and initial uniforms at startup
+@export var DEBUG_HEX_GRID: bool = false
 var _timing_png_read_parse_ms: float = 0.0
 var _timing_decompress_ms: float = 0.0
 var _timing_filter_ms: float = 0.0
@@ -52,15 +60,64 @@ func _ready() -> void:
 	var shader_material = ShaderMaterial.new()
 	shader_material.shader = shader
 	
-	# Set default params
+	# Set default params (terrain only; hex overlay on next_pass)
 	shader_material.set_shader_parameter("albedo", Color(0.3, 0.5, 0.2)) # Base green
 	shader_material.set_shader_parameter("roughness", 0.9)
-	shader_material.set_shader_parameter("hex_size", Constants.HEX_SIZE_M)
-	shader_material.set_shader_parameter("fade_start", Constants.GRID_FADE_START_M)
-	shader_material.set_shader_parameter("fade_end", Constants.GRID_FADE_END_M)
-	
-	shared_terrain_material = shader_material # Reuse variable name but it's now ShaderMaterial
-	print("TerrainLoader: Unified terrain shader loaded.")
+
+	# Hex overlay as next_pass (grid, hover, selection cutout); same mesh, renders on top
+	var hex_shader = load("res://rendering/hex_grid.gdshader")
+	if hex_shader:
+		var hex_material = ShaderMaterial.new()
+		hex_material.shader = hex_shader
+		hex_material.render_priority = 1
+		hex_material.set_shader_parameter("hex_size", Constants.HEX_SIZE_M)
+		hex_material.set_shader_parameter("show_grid", Constants.GRID_DEFAULT_VISIBLE)
+		hex_material.set_shader_parameter("grid_fade_start", Constants.GRID_FADE_START_M)
+		hex_material.set_shader_parameter("grid_fade_end", Constants.GRID_FADE_END_M)
+		shader_material.next_pass = hex_material
+		print("TerrainLoader: Hex overlay (next_pass) attached.")
+		if DEBUG_HEX_GRID:
+			print("[HEX] Hex overlay shader loaded: %s" % (hex_shader != null))
+			print("[HEX] Hex material created: %s" % (hex_material != null))
+			print("[HEX] Set as next_pass on terrain material: %s" % (shader_material.next_pass != null))
+			print("[HEX] hex_size=%s show_grid=%s grid_fade_start=%s grid_fade_end=%s" % [Constants.HEX_SIZE_M, Constants.GRID_DEFAULT_VISIBLE, Constants.GRID_FADE_START_M, Constants.GRID_FADE_END_M])
+	else:
+		push_warning("TerrainLoader: hex_grid.gdshader not found; hex overlay disabled.")
+
+	# Overview texture: same world extent as chunk grid (origin 0,0); used for continental color at high altitude
+	var overview_path: String = terrain_metadata.get("overview_texture", "")
+	var overview_origin_vec := Vector2.ZERO
+	var overview_size_vec := Vector2.ZERO
+	if overview_path:
+		var tex_path: String = Constants.TERRAIN_DATA_PATH + overview_path
+		if FileAccess.file_exists(tex_path):
+			var img := Image.load_from_file(tex_path)
+			if img and not img.is_empty():
+				var tex := ImageTexture.create_from_image(img)
+				shader_material.set_shader_parameter("overview_texture", tex)
+				overview_origin_vec = Vector2.ZERO
+				# Always use chunk grid extent (same as ChunkManager overview plane) so macro view aligns
+				var mw: int = terrain_metadata.get("master_heightmap_width", 0)
+				var mh: int = terrain_metadata.get("master_heightmap_height", 0)
+				var grid_w: int = (mw + chunk_size_px - 1) / chunk_size_px
+				var grid_h: int = (mh + chunk_size_px - 1) / chunk_size_px
+				var ow: float = float(grid_w) * float(chunk_size_px) * resolution_m
+				var oh: float = float(grid_h) * float(chunk_size_px) * resolution_m
+				overview_size_vec = Vector2(ow, oh)
+				shader_material.set_shader_parameter("overview_origin", overview_origin_vec)
+				shader_material.set_shader_parameter("overview_size", overview_size_vec)
+				shader_material.set_shader_parameter("use_overview", true)
+				print("TerrainLoader: Overview texture loaded (%.0f x %.0f m, grid %dx%d)" % [ow, oh, grid_w, grid_h])
+	if overview_size_vec == Vector2.ZERO:
+		shader_material.set_shader_parameter("use_overview", false)
+
+	shared_terrain_material = shader_material
+	# LOD 2+ material: same terrain, no hex next_pass (avoids overlay on coarse chunks; grid only on LOD 0-1).
+	var mat_lod2plus: ShaderMaterial = shader_material.duplicate(true) as ShaderMaterial
+	mat_lod2plus.next_pass = null
+	shared_terrain_material_lod2plus = mat_lod2plus
+	add_to_group("terrain_loader")
+	print("TerrainLoader: Unified terrain shader loaded (LOD 0-1 with hex overlay, LOD 2+ without).")
 
 
 ## Load a single chunk and return a complete Node3D with mesh and collision
@@ -94,8 +151,8 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 	var lod_scale = int(pow(2, lod))
 	var vertex_spacing = resolution_m * lod_scale
 	
-	# Generate mesh with LOD-scaled vertex spacing and decimated resolution
-	var mesh = _generate_mesh_lod(heights, vertex_spacing, lod, false) # Pass false to disable verbose logging
+	# Generate mesh with LOD-scaled vertex spacing and decimated resolution (verbose=false to avoid per-chunk prints)
+	var mesh = _generate_mesh_lod(heights, vertex_spacing, lod, false)
 	
 	# Create MeshInstance3D
 	var mesh_instance = MeshInstance3D.new()
@@ -120,7 +177,11 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 		debug_material.cull_mode = BaseMaterial3D.CULL_DISABLED
 		mesh_instance.set_surface_override_material(0, debug_material)
 	else:
-		mesh_instance.set_surface_override_material(0, shared_terrain_material)
+		# Hex overlay only on LOD 0-1 so grid is visible where it matters; LOD 2+ no overlay to reduce doubling.
+		if lod <= 1:
+			mesh_instance.set_surface_override_material(0, shared_terrain_material)
+		else:
+			mesh_instance.set_surface_override_material(0, shared_terrain_material_lod2plus)
 	
 	# Position chunk in world space using LOD-aware positioning
 	var world_pos = _chunk_to_world_position(chunk_x, chunk_y, lod)
@@ -142,10 +203,6 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 		print("[TIME] Normal computation: %dms" % int(_timing_normals_ms))
 		print("[TIME] Collision shape creation: %dms" % int(_timing_collision_ms))
 		print("[TIME] Total chunk load: %dms (lod%d_x%d_y%d)" % [total_ms, lod, chunk_x, chunk_y])
-	
-	# Update statistics
-	var mesh_res = LOD_MESH_RESOLUTION[lod]
-	var verts = mesh_res * mesh_res
 	
 	return mesh_instance
 
@@ -210,9 +267,11 @@ func _load_16bit_heightmap(path: String) -> Array[float]:
 	"""
 	var heights: Array[float] = []
 	if _height_cache.has(path):
-		print("[CACHE] Hit: %s (skipped decode)" % path.get_file())
+		if DEBUG_CHUNK_TIMING:
+			print("[CACHE] Hit: %s (skipped decode)" % path.get_file())
 		return _height_cache[path]
-	print("[CACHE] Miss: %s" % path.get_file())
+	if DEBUG_CHUNK_TIMING:
+		print("[CACHE] Miss: %s" % path.get_file())
 	if not FileAccess.file_exists(path):
 		push_error("Heightmap file not found: " + path)
 		return heights
@@ -231,14 +290,50 @@ func _load_16bit_heightmap(path: String) -> Array[float]:
 	return heights
 
 
+## Return interpolated height at world XZ (meters). Uses LOD 0 chunk from height cache.
+## Returns -1.0 if chunk not in cache (caller cannot build slice).
+func get_height_at(world_x: float, world_z: float) -> float:
+	var chunk_world_size: float = float(chunk_size_px) * resolution_m
+	var chunk_x: int = int(floor(world_x / chunk_world_size))
+	var chunk_y: int = int(floor(world_z / chunk_world_size))
+	var path: String = "res://data/terrain/chunks/lod0/chunk_%d_%d.png" % [chunk_x, chunk_y]
+	if not _height_cache.has(path):
+		return -1.0
+	var heights: Array = _height_cache[path]
+	var lx: float = world_x - float(chunk_x) * chunk_world_size
+	var lz: float = world_z - float(chunk_y) * chunk_world_size
+	var px: float = lx / resolution_m
+	var pz: float = lz / resolution_m
+	var w: int = chunk_size_px
+	if px < 0.0 or px >= float(w) or pz < 0.0 or pz >= float(w):
+		return -1.0
+	var i0: int = clampi(int(floor(px)), 0, w - 1)
+	var j0: int = clampi(int(floor(pz)), 0, w - 1)
+	var i1: int = mini(i0 + 1, w - 1)
+	var j1: int = mini(j0 + 1, w - 1)
+	var fx: float = clampf(px - float(i0), 0.0, 1.0)
+	var fz: float = clampf(pz - float(j0), 0.0, 1.0)
+	var h00: float = float(heights[j0 * w + i0])
+	var h10: float = float(heights[j0 * w + i1])
+	var h01: float = float(heights[j1 * w + i0])
+	var h11: float = float(heights[j1 * w + i1])
+	var h0: float = lerp(h00, h10, fx)
+	var h1: float = lerp(h01, h11, fx)
+	return lerp(h0, h1, fz)
+
+
 ## Call from main thread to cache heights decoded on worker (async path).
-func _add_to_height_cache(path: String, heights: Array[float]) -> void:
+## Accepts untyped Array so worker result can be passed; converts to Array[float] for cache.
+func _add_to_height_cache(path: String, heights: Array) -> void:
 	if path.is_empty() or heights.is_empty():
 		return
+	var typed: Array[float] = []
+	for i in range(heights.size()):
+		typed.append(float(heights[i]))
 	if _height_cache.size() >= HEIGHT_CACHE_MAX and _height_cache_order.size() > 0:
 		var oldest = _height_cache_order.pop_front()
 		_height_cache.erase(oldest)
-	_height_cache[path] = heights
+	_height_cache[path] = typed
 	_height_cache_order.append(path)
 
 
@@ -326,7 +421,9 @@ func _decode_png_to_heights(path: String, max_elev: float) -> Array[float]:
 			var hi = recon[x * 2]
 			var lo = recon[x * 2 + 1]
 			var value_16 = (hi << 8) | lo
-			var height_m = (float(value_16) / 65535.0) * max_elev
+			# Sea level is stored as SEA_LEVEL_UINT16 in PNG; map back to 0m
+			var height_m = (float(value_16) - float(Constants.SEA_LEVEL_UINT16)) / (65535.0 - float(Constants.SEA_LEVEL_UINT16)) * max_elev
+			height_m = clampf(height_m, 0.0, max_elev)
 			heights.append(height_m)
 	return heights
 
@@ -397,8 +494,8 @@ func _extract_heights_from_image(image: Image) -> Array[float]:
 			# We need to convert back to 16-bit equivalent
 			
 			var pixel_value = gray_value * 65535.0
-			var height_m = (pixel_value / 65535.0) * max_elevation_m
-			
+			var height_m = (pixel_value - float(Constants.SEA_LEVEL_UINT16)) / (65535.0 - float(Constants.SEA_LEVEL_UINT16)) * max_elevation_m
+			height_m = clampf(height_m, 0.0, max_elevation_m)
 			heights.append(height_m)
 	
 	return heights
@@ -438,7 +535,7 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 	var chunk_world_size = chunk_size_px * resolution_m * lod_scale
 	var actual_vertex_spacing = chunk_world_size / float(mesh_res - 1) # -1 because we want edge-to-edge
 	
-	if verbose:
+	if DEBUG_CHUNK_TIMING and verbose:
 		print("Generating mesh: LOD %d, %d×%d vertices, %.1fm spacing..." % [lod, mesh_res, mesh_res, actual_vertex_spacing])
 	
 	var vertices = PackedVector3Array()
@@ -467,7 +564,7 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 			)
 			vertices.append(pos)
 	
-	if verbose:
+	if DEBUG_CHUNK_TIMING and verbose:
 		print("Generated %d vertices" % vertices.size())
 	
 	# Generate indices (two triangles per quad)
@@ -489,7 +586,7 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 			indices.append(bottom_right)
 			indices.append(bottom_left)
 	
-	if verbose:
+	if DEBUG_CHUNK_TIMING and verbose:
 		print("Generated %d triangles" % (indices.size() / 3))
 	
 	_timing_mesh_ms = Time.get_ticks_msec() - t0
@@ -634,7 +731,8 @@ func _create_heightmap_collision_lod(heights: Array[float], chunk_x: int, chunk_
 
 ## Start async load: Phase A runs on WorkerThreadPool. Returns { task_id, args }.
 ## Caller stores args; when is_task_completed(task_id), wait then finish_load(args["result"], ...).
-func start_async_load(chunk_x: int, chunk_y: int, lod: int) -> Dictionary:
+## debug_diagnostic: when true, worker may print height pipeline diagnostics for the Alps chunk (67,35) LOD 0.
+func start_async_load(chunk_x: int, chunk_y: int, lod: int, debug_diagnostic: bool = false) -> Dictionary:
 	var chunk_path: String = "res://data/terrain/chunks/lod%d/chunk_%d_%d.png" % [lod, chunk_x, chunk_y]
 	var args: Dictionary = {
 		"chunk_x": chunk_x,
@@ -644,15 +742,18 @@ func start_async_load(chunk_x: int, chunk_y: int, lod: int) -> Dictionary:
 		"chunk_size_px": chunk_size_px,
 		"max_elevation_m": max_elevation_m,
 		"LOD_MESH_RESOLUTION": LOD_MESH_RESOLUTION.duplicate(),
-		"result": {}
+		"result": {},
+		"debug_diagnostic": debug_diagnostic
 	}
 	if _height_cache.has(chunk_path):
 		args["heights"] = _height_cache[chunk_path]
 	else:
 		args["path"] = chunk_path
-	var callable_task = Callable(self, "_compute_chunk_data").bind(args)
+	# Use TerrainWorker (static class) so worker never references this node; avoids "previously freed" and editor freeze on stop
+	var callable_task = Callable(_TerrainWorkerScript, "compute_chunk_data").bind(args)
 	var task_id = WorkerThreadPool.add_task(callable_task, false, "chunk_lod%d_%d_%d" % [lod, chunk_x, chunk_y])
-	print("[ASYNC] Submitted lod%d_x%d_y%d" % [lod, chunk_x, chunk_y])
+	if DEBUG_CHUNK_TIMING:
+		print("[ASYNC] Submitted lod%d_x%d_y%d" % [lod, chunk_x, chunk_y])
 	return { "task_id": task_id, "args": args }
 
 
@@ -675,10 +776,37 @@ func _compute_chunk_data(args: Dictionary) -> void:
 	if heights.is_empty():
 		args["result"] = {}
 		return
-	var mesh_res: int = mesh_resolutions[lod]
-	var sample_stride: int = cpx / mesh_res
 	var lod_scale: int = int(pow(2, lod))
 	var chunk_world_size: float = cpx * res_m * lod_scale
+	var world_pos = Vector3(chunk_x * chunk_world_size, 0, chunk_y * chunk_world_size)
+	# LOD 4 ultra: at continental zoom chunks are a few pixels; flat quad at avg elevation is enough
+	var ultra_lod = (lod == 4)
+	var avg_elevation = 0.0
+	if ultra_lod:
+		var sum_h = 0.0
+		for h in heights:
+			sum_h += h
+		avg_elevation = sum_h / heights.size()
+		args["result"] = {
+			"chunk_x": chunk_x,
+			"chunk_y": chunk_y,
+			"lod": lod,
+			"world_pos": world_pos,
+			"mesh_res": 2,
+			"chunk_world_size": chunk_world_size,
+			"height_sample_spacing": chunk_world_size,
+			"heights_for_cache": heights if did_decode else [],
+			"path_for_cache": args.get("path", ""),
+			"ultra_lod": true,
+			"avg_elevation": avg_elevation,
+			"vertices": PackedVector3Array(),
+			"normals": PackedVector3Array(),
+			"indices": PackedInt32Array(),
+			"height_data": PackedFloat32Array()
+		}
+		return
+	var mesh_res: int = mesh_resolutions[lod]
+	var sample_stride: int = cpx / mesh_res
 	var actual_vertex_spacing: float = chunk_world_size / float(mesh_res - 1)
 	var vertices = PackedVector3Array()
 	var indices = PackedInt32Array()
@@ -708,7 +836,6 @@ func _compute_chunk_data(args: Dictionary) -> void:
 			var px = mini(x * sample_stride, cpx - 1)
 			var py = mini(y * sample_stride, cpx - 1)
 			height_data[y * mesh_res + x] = heights[py * cpx + px]
-	var world_pos = Vector3(chunk_x * chunk_world_size, 0, chunk_y * chunk_world_size)
 	var height_sample_spacing = chunk_world_size / float(mesh_res - 1)
 	args["result"] = {
 		"vertices": vertices,
@@ -723,26 +850,39 @@ func _compute_chunk_data(args: Dictionary) -> void:
 		"chunk_world_size": chunk_world_size,
 		"height_sample_spacing": height_sample_spacing,
 		"heights_for_cache": heights if did_decode else [],
-		"path_for_cache": args.get("path", "")
+		"path_for_cache": args.get("path", ""),
+		"ultra_lod": false,
+		"avg_elevation": 0.0
 	}
 
 
-## Phase B: main thread only. Creates ArrayMesh, MeshInstance3D, collision; returns the mesh node.
-func finish_load(computed_data: Dictionary, collision_body: StaticBody3D, debug_colors: bool = false) -> Node3D:
-	var t0 = Time.get_ticks_msec()
+## Phase B step 1 (MESH): Create ArrayMesh only. Returns mesh or null.
+func finish_load_step_mesh(computed_data: Dictionary) -> ArrayMesh:
 	if computed_data.is_empty():
 		return null
+	var chunk_world_size: float = computed_data["chunk_world_size"]
+	if computed_data.get("ultra_lod", false):
+		# LOD 4 ultra: flat quad at average elevation (<1ms)
+		var avg_y: float = computed_data.get("avg_elevation", 0.0)
+		var u_verts = PackedVector3Array([
+			Vector3(0, avg_y, 0),
+			Vector3(chunk_world_size, avg_y, 0),
+			Vector3(chunk_world_size, avg_y, chunk_world_size),
+			Vector3(0, avg_y, chunk_world_size)
+		])
+		var u_normals = PackedVector3Array([Vector3.UP, Vector3.UP, Vector3.UP, Vector3.UP])
+		var u_indices = PackedInt32Array([0, 1, 2, 0, 2, 3])
+		var u_arrays: Array = []
+		u_arrays.resize(Mesh.ARRAY_MAX)
+		u_arrays[Mesh.ARRAY_VERTEX] = u_verts
+		u_arrays[Mesh.ARRAY_NORMAL] = u_normals
+		u_arrays[Mesh.ARRAY_INDEX] = u_indices
+		var u_mesh = ArrayMesh.new()
+		u_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, u_arrays)
+		return u_mesh
 	var vertices: PackedVector3Array = computed_data["vertices"]
 	var normals: PackedVector3Array = computed_data["normals"]
 	var indices: PackedInt32Array = computed_data["indices"]
-	var height_data: PackedFloat32Array = computed_data["height_data"]
-	var chunk_x: int = computed_data["chunk_x"]
-	var chunk_y: int = computed_data["chunk_y"]
-	var lod: int = computed_data["lod"]
-	var world_pos: Vector3 = computed_data["world_pos"]
-	var mesh_res: int = computed_data["mesh_res"]
-	var chunk_world_size: float = computed_data["chunk_world_size"]
-	var height_sample_spacing: float = computed_data["height_sample_spacing"]
 	var arrays: Array = []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = vertices
@@ -750,6 +890,17 @@ func finish_load(computed_data: Dictionary, collision_body: StaticBody3D, debug_
 	arrays[Mesh.ARRAY_INDEX] = indices
 	var mesh = ArrayMesh.new()
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return mesh
+
+
+## Phase B step 2 (SCENE): Create MeshInstance3D, set material and transform. Caller adds to scene.
+func finish_load_step_scene(computed_data: Dictionary, mesh: ArrayMesh, debug_colors: bool = false) -> MeshInstance3D:
+	if mesh == null:
+		return null
+	var chunk_x: int = computed_data["chunk_x"]
+	var chunk_y: int = computed_data["chunk_y"]
+	var lod: int = computed_data["lod"]
+	var world_pos: Vector3 = computed_data["world_pos"]
 	var mesh_instance = MeshInstance3D.new()
 	mesh_instance.name = "Chunk_LOD%d_%d_%d" % [lod, chunk_x, chunk_y]
 	mesh_instance.mesh = mesh
@@ -765,8 +916,30 @@ func finish_load(computed_data: Dictionary, collision_body: StaticBody3D, debug_
 		debug_material.cull_mode = BaseMaterial3D.CULL_DISABLED
 		mesh_instance.set_surface_override_material(0, debug_material)
 	else:
-		mesh_instance.set_surface_override_material(0, shared_terrain_material)
+		if lod <= 1:
+			mesh_instance.set_surface_override_material(0, shared_terrain_material)
+		else:
+			mesh_instance.set_surface_override_material(0, shared_terrain_material_lod2plus)
 	mesh_instance.position = world_pos
+	return mesh_instance
+
+
+## Phase B step 3 (COLLISION): Create HeightMapShape3D + CollisionShape3D, add to body. No-op for LOD >= 2.
+func finish_load_step_collision(computed_data: Dictionary, collision_body: StaticBody3D) -> void:
+	var lod: int = computed_data["lod"]
+	if lod >= 2:
+		return
+	if computed_data.get("ultra_lod", false):
+		return
+	if collision_body == null:
+		return
+	var height_data: PackedFloat32Array = computed_data["height_data"]
+	var chunk_x: int = computed_data["chunk_x"]
+	var chunk_y: int = computed_data["chunk_y"]
+	var world_pos: Vector3 = computed_data["world_pos"]
+	var mesh_res: int = computed_data["mesh_res"]
+	var chunk_world_size: float = computed_data["chunk_world_size"]
+	var height_sample_spacing: float = computed_data["height_sample_spacing"]
 	var heightmap_shape = HeightMapShape3D.new()
 	heightmap_shape.map_width = mesh_res
 	heightmap_shape.map_depth = mesh_res
@@ -777,8 +950,20 @@ func finish_load(computed_data: Dictionary, collision_body: StaticBody3D, debug_
 	var half_size = chunk_world_size * 0.5
 	collision_shape.position = Vector3(world_pos.x + half_size, 0, world_pos.z + half_size)
 	collision_shape.scale = Vector3(height_sample_spacing, 1.0, height_sample_spacing)
-	if collision_body:
-		collision_body.add_child(collision_shape)
-	var phase_b_ms = Time.get_ticks_msec() - t0
-	print("[ASYNC] Completed lod%d_x%d_y%d (Phase B: %dms)" % [lod, chunk_x, chunk_y, int(phase_b_ms)])
+	collision_body.add_child(collision_shape)
+
+
+## Legacy: full Phase B in one call (for initial load only). Creates mesh, scene node, and collision (LOD 0-1).
+func finish_load(computed_data: Dictionary, collision_body: StaticBody3D, debug_colors: bool = false) -> Node3D:
+	if computed_data.is_empty():
+		return null
+	var mesh = finish_load_step_mesh(computed_data)
+	if mesh == null:
+		return null
+	var mesh_instance = finish_load_step_scene(computed_data, mesh, debug_colors)
+	if mesh_instance == null:
+		return null
+	finish_load_step_collision(computed_data, collision_body)
+	if DEBUG_CHUNK_TIMING:
+		print("[ASYNC] Completed lod%d_x%d_y%d (Phase B: full)" % [computed_data["lod"], computed_data["chunk_x"], computed_data["chunk_y"]])
 	return mesh_instance

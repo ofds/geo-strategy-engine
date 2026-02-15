@@ -6,9 +6,10 @@ class_name Constants
 
 # ── Data & Heightmap ─────────────────────────────────────────────
 
-const RESOLUTION_M: float = 30.0 # Ground sampling distance (meters/pixel)
+const RESOLUTION_M: float = 90.0 # Ground sampling distance at LOD 0 (90m for Europe SRTM3)
 const HEIGHT_BIT_DEPTH: int = 65535 # UInt16 max value
 const SEA_LEVEL_M: float = 0.0 # Values below this become 0
+const SEA_LEVEL_UINT16: int = 1000 # Pipeline maps 0m to this in PNG; loader maps it back to 0m
 
 
 # ── Chunks ───────────────────────────────────────────────────────
@@ -31,17 +32,20 @@ const LOD_RESOLUTIONS_M: Array[float] = [
 	1440.0, # LOD 4 — 16x downsampled
 ]
 
-## Distance thresholds for switching TO this LOD (in meters)
+## Distance thresholds for switching TO this LOD (in meters). Continental scale (Europe).
 const LOD_DISTANCES_M: Array[float] = [
-	0.0, # LOD 0: 0–10 km
-	10000.0, # LOD 1: 10–25 km
-	25000.0, # LOD 2: 25–50 km
-	50000.0, # LOD 3: 50–100 km
-	100000.0, # LOD 4: 100+ km
+	0.0, # LOD 0: 0–50 km (3×3 full-detail)
+	50000.0, # LOD 1: 50–75 km
+	75000.0, # LOD 2: 75–200 km
+	200000.0, # LOD 3: 200–500 km
+	500000.0, # LOD 4: 500 km+
 ]
 
 const LOD_HYSTERESIS: float = 0.10 # 10% overlap to prevent flickering
-
+## Inner ring: LOD 0 cells within this (500 km). Used by ChunkManager for desired set.
+const INNER_RADIUS_M: float = 500000.0
+## visible_radius = max(INNER_RADIUS_M, altitude * this). Used by ChunkManager.
+const VISIBLE_RADIUS_ALTITUDE_FACTOR: float = 2.5
 
 # ── Streaming ────────────────────────────────────────────────────
 
@@ -69,7 +73,7 @@ const EARTH_RADIUS_M: float = 6371000.0 # Mean Earth radius
 # ── Camera — Macro View ──────────────────────────────────────────
 
 const CAMERA_MIN_ALTITUDE_M: float = 5000.0 # 5 km (close tactical)
-const CAMERA_MAX_ALTITUDE_M: float = 500000.0 # 500 km (strategic continental)
+const CAMERA_MAX_ALTITUDE_M: float = 5000000.0 # 5,000 km (full continental, e.g. all of Europe)
 const CAMERA_BOUNDS_MARGIN_M: float = 50000.0 # 50 km beyond region edge
 const CAMERA_SPEED_FACTOR: float = 100.0 # m/s per 1000m altitude → speed = 100 * (alt/1000)
 const CAMERA_PITCH_MIN_DEG: float = 30.0 # Minimum pitch from horizon

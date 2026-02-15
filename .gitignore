@@ -7,3 +7,4 @@ data/
 profiling_run.txt
 profiling_run_err.txt
 profiling_run_combined.txt
+tools/

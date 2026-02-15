@@ -1,0 +1,26 @@
+---
+description: Hex grid overlay must never draw through terrain; depth test is required
+globs: rendering/hex_grid.gdshader
+alwaysApply: false
+---
+
+# Hex overlay depth — no “grid through ground”
+
+The hex overlay in `hex_grid.gdshader` is drawn as `next_pass` on terrain chunks. It **must** respect depth so the grid never appears through the ground.
+
+## Rule
+
+- **Never use `depth_test_disabled`** for this overlay. With depth test disabled, every chunk draws its grid regardless of depth, so grids from behind terrain show through the ground.
+- **Always use `depth_test_read`** so the overlay is only drawn where the fragment is the frontmost surface (same or closer than the depth buffer).
+- **Keep a depth bias** so the overlay passes the depth test. Fragment `DEPTH` is unreliable with `depth_draw_never` (Godot may not use it for the test). Use a **vertex offset toward the camera**: `world_pos += view_dir * depth_bias_m` (uniform `depth_bias_m`, e.g. 15 m). Tune so the grid is visible and never shows through terrain.
+
+## Why
+
+- Terrain uses `depth_draw_opaque` and writes depth. Overlay uses `depth_draw_never` and only reads depth.
+- If the overlay does not test depth, back chunks’ grids are visible through front terrain (“grid through ground”).
+- If the overlay tests depth but has no bias, the same-depth or strict-less comparison can make the grid invisible; a small bias fixes visibility while keeping correct occlusion.
+
+## When editing this shader
+
+- Do not switch to `depth_test_disabled` to “fix” visibility; fix visibility with depth bias or vertex offset instead.
+- If changing render modes, ensure the grid never draws through terrain and document the chosen approach in the shader comments and in `docs/PROGRESS.md`.

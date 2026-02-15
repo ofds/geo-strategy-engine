@@ -1,11 +1,13 @@
-[gd_scene load_steps=8 format=3 uid="uid://do3a3bxwl1xjy"]
+[gd_scene load_steps=10 format=3 uid="uid://do3a3bxwl1xjy"]
 
+[ext_resource type="Script" uid="uid://breemjaddcckb" path="res://core/hex_selector.gd" id="1_hex_selector"]
 [ext_resource type="Script" uid="uid://dyrv4lovx4xh0" path="res://core/terrain_loader.gd" id="1_terrain"]
 [ext_resource type="Script" uid="uid://dtda6a3yr57dt" path="res://core/chunk_manager.gd" id="2_chunk_manager"]
 [ext_resource type="Script" uid="uid://caokqviv0yju5" path="res://rendering/basic_camera.gd" id="3_camera"]
 [ext_resource type="Script" uid="uid://cvgnh0t0j4ixb" path="res://ui/loading_screen.gd" id="4_loading"]
 [ext_resource type="Script" uid="uid://chvlyfnpd2cik" path="res://ui/fps_counter.gd" id="5_fps"]
 [ext_resource type="Script" uid="uid://bt5e2hcmpa5ju" path="res://tools/profiling_camera_driver.gd" id="6_profiling"]
+[ext_resource type="Script" uid="uid://u7odvaowe8vo" path="res://tools/diagnostic_camera_driver.gd" id="7_diagnostic"]
 
 [sub_resource type="Environment" id="Environment_1"]
 background_mode = 1
@@ -21,17 +23,24 @@ tonemap_white = 8.0
 [node name="ProfilingDriver" type="Node" parent="."]
 script = ExtResource("6_profiling")
 
+[node name="DiagnosticCameraDriver" type="Node" parent="."]
+script = ExtResource("7_diagnostic")
+
 [node name="TerrainLoader" type="Node" parent="."]
 script = ExtResource("1_terrain")
-DEBUG_CHUNK_TIMING = true
+DEBUG_HEX_GRID = true
 
 [node name="ChunkManager" type="Node3D" parent="."]
 script = ExtResource("2_chunk_manager")
+
+[node name="HexSelector" type="Node3D" parent="."]
+script = ExtResource("1_hex_selector")
 
 [node name="Camera3D" type="Camera3D" parent="."]
 transform = Transform3D(1, 0, 0, 0, 0.707107, 0.707107, 0, -0.707107, 0.707107, 0, 100, 100)
 fov = 60.0
 script = ExtResource("3_camera")
+DEBUG_DIAGNOSTIC = true
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
 transform = Transform3D(0.866025, -0.433013, 0.25, 0, 0.5, 0.866025, -0.5, -0.75, 0.433013, 0, 5000, 0)
