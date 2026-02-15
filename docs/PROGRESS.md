@@ -43,6 +43,7 @@
 
 - **LOD deformation**: Hex shapes distort on coarse LOD chunks (LOD 2+) because vertex density is too low to form hex edges. Options: disable hex interaction on coarse LODs, or investigate LOD-independent overlay (Decals or separate grid mesh).
 - **Hex grid fade tuning**: Grid visibility at different zoom levels needs finer adjustment.
+- **Hex selection = terrain modification**: Selection is implemented by modifying terrain (vertex lift, fragment overrides, discard). That can cause drip at boundaries and non-continuous hex borders. **Alternative design**: hex grid and selection as a **separate overlay** (e.g. decal layer or second mesh that draws hex outlines and selection effect without modifying terrain geometry) so borders stay continuous and the lift is a separate drawn layer.
 
 ## 📋 Backlog — Feature Ideas & Vision
 
@@ -50,7 +51,7 @@
 
 These improve the look and feel of what already exists. No new systems required.
 
-1. ~~**Hex selection UX overhaul**~~ **Done**: Flat plateau lift (60m, steep ramp in outer 10% of hex radius; visible gap/shadow), emissive golden edge glow (Gaussian ~40m falloff, 2Hz pulse, visible with grid off), 20% golden tint on selected hex, surrounding terrain darkens 15% over 0.3s when a hex is selected, subtle ±2m floating oscillation at 1.5Hz. Selection animates in over ~0.3s (glow 0.1s, lift 0.25s ease-out, darken 0.3s, tint 0.2s). Deselect instant. Hover: thin white border (30m) + 8% tint, no lift/glow/darkening. All shader-side; no geometry changes.
+1. ~~**Hex selection UX overhaul**~~ **Done**: Flat plateau lift (140m, steep ramp in outer 10%), emissive golden edge glow, 22% golden tint + terrain pop (brightness/saturation boost on selected hex), surrounding darken 15%, floating oscillation only in interior (no border ondulations). Lift/glow/darken/tint staggered over ~0.3s. Deselect instant. Hover: thin white border + 8% tint.
 
 2. **Europe-scale terrain**: Process all of Europe (35-72°N, -12-45°E) using SRTM3 (90m resolution) for continental coverage at ~7GB on disk. The streaming system already handles arbitrary region sizes — only the data pipeline needs to run. This transforms the zoom-out view from "edge of Alps" to "full continent with coastlines." Target: shareable GIF showing zoom from street-level Alps to continental Europe.
 

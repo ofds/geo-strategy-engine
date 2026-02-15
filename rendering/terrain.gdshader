@@ -36,6 +36,8 @@ varying float v_selection_time; // Pass-through for fragment animation
 varying vec3 v_view_dir; // For rim lighting calculation in fragment
 varying float v_elevation;
 varying vec3 v_world_normal;
+varying float v_plateau_shape; // 1.0 = interior, 0.5 = depth band, 0.0 = void (discard)
+varying float v_in_void;      // 1.0 = in void zone (don't draw), 0.0 = draw
 
 // --- Constants ---
 const float SQRT_3 = 1.73205080757;
@@ -134,24 +136,50 @@ void vertex() {
     const float EPS = 0.01;
     bool in_selected = (abs(pos_rounded.x - sel_rounded.x) < EPS && abs(pos_rounded.y - sel_rounded.y) < EPS);
     v_is_selected = in_selected ? 1.0 : 0.0;
+    v_plateau_shape = 0.0;
+    v_in_void = 0.0;
 
     if (in_selected) {
-        // Flat plateau: full 60m in interior, steep ramp in outer 10% of radius
         vec2 center_world = axial_to_world(sel_rounded, hex_size);
-        float dist_to_center = distance(world_xz, center_world);
-        float hex_radius = hex_size * 0.5; // apothem (center to flat edge)
-        float plateau = 60.0 * smoothstep(hex_radius * 0.9, hex_radius, dist_to_center);
-        // Animate lift over 0.25s with ease-out (decelerating rise)
+        vec2 d = world_xz - center_world;
+        d = abs(d);
+        float d1 = d.y;
+        float d2 = abs(dot(d, vec2(SQRT_3/2.0, 0.5)));
+        float dist_from_center = max(d1, d2);
+        float hex_radius = hex_size * 0.5; // apothem
+        float dist_from_edge_inside = hex_radius - dist_from_center;
+
+        // Pizza-from-cardboard: interior (flat top), depth (thickness), then shadow footprint (solid, no drip).
+        const float VOID_WIDTH = 38.0;   // outer 38m = shadow (hex cutout on ground), drawn solid
+        const float DEPTH_WIDTH = 22.0;   // next 22m = depth band (visible thickness)
+        const float DEPTH_M = 32.0;       // depth band 32m below top
+        const float LIFT_TOP = 180.0;     // interior lift
+        // Sharp transitions — no smoothstep, so no dripping at boundaries
+        float void_zone = 1.0 - step(VOID_WIDTH, dist_from_edge_inside);
+        float depth_zone = step(VOID_WIDTH, dist_from_edge_inside) * (1.0 - step(VOID_WIDTH + DEPTH_WIDTH, dist_from_edge_inside));
+        float interior_zone = step(VOID_WIDTH + DEPTH_WIDTH, dist_from_edge_inside);
+
+        v_in_void = void_zone;
+        v_plateau_shape = interior_zone + 0.5 * depth_zone; // 1=interior, 0.5=depth, 0=void
+
+        float lift_depth = LIFT_TOP - DEPTH_M; // depth band height
+        float lift = LIFT_TOP * interior_zone + lift_depth * depth_zone + 0.0 * void_zone;
         float lift_raw = min(selection_time / 0.25, 1.0);
         float lift_fade = 1.0 - pow(1.0 - lift_raw, 3.0);
-        VERTEX.y += plateau * lift_fade;
-        // Subtle floating oscillation (±2m at 1.5Hz)
-        VERTEX.y += 2.0 * sin(TIME * 1.5) * lift_fade;
+        float lift_amount = lift * lift_fade;
+        float float_osc = 2.0 * sin(TIME * 1.5) * (interior_zone + depth_zone) * lift_fade;
+
+        VERTEX.y += lift_amount + float_osc;
+        v_world_pos = world_pos.xyz + vec3(0.0, lift_amount + float_osc, 0.0);
     }
-    // Else: zero displacement — neighbors never move
 }
 
 void fragment() {
+    bool is_selected = (v_is_selected > 0.5);
+    bool has_selection = (selected_hex_center.x < 900000.0);
+
+    // No discard — ground is always drawn so the map feels continuous (lifted surface, not a hole).
+
     // 1. Base terrain color from elevation and slope
     vec3 n = normalize(v_world_normal);
     vec3 height_col = terrain_height_color(v_elevation);
@@ -160,8 +188,6 @@ void fragment() {
     vec3 base_col = mix(height_col, steep_col, steep_mix);
 
     // 2. Selection state and staggered animation timings
-    bool is_selected = (v_is_selected > 0.5);
-    bool has_selection = (selected_hex_center.x < 900000.0);
     float glow_fade = has_selection ? min(v_selection_time / 0.1, 1.0) : 0.0;
     float darken_fade = has_selection ? min(v_selection_time / 0.3, 1.0) : 0.0;
     float tint_fade = has_selection ? min(v_selection_time / 0.2, 1.0) : 0.0;
@@ -178,10 +204,16 @@ void fragment() {
     float fog_factor = smoothstep(50000.0, 200000.0, dist);
     base_col = mix(base_col, fog_color, fog_factor);
 
-    // 5. Selection tint (20% golden) — selected hex is brightest on screen
+    // 5. Selection: golden tint + terrain pop (only on lifted piece — not on shadow footprint)
     vec3 selection_tint = vec3(1.0, 0.9, 0.5);
-    if (is_selected) {
-        base_col = mix(base_col, selection_tint, 0.20 * tint_fade);
+    if (is_selected && v_in_void < 0.5) {
+        base_col = mix(base_col, selection_tint, 0.22 * tint_fade);
+        float pop = 0.12 * tint_fade;
+        base_col = base_col * (1.0 + pop) + vec3(pop * 0.15);
+        float sat = 1.0 + 0.2 * tint_fade;
+        vec3 lum = vec3(0.299, 0.587, 0.114);
+        vec3 gray = vec3(dot(base_col, lum));
+        base_col = mix(gray, base_col, sat);
     }
 
     // 6. Hover: thin white border (30m), 8% tint — only when not selected
@@ -199,9 +231,10 @@ void fragment() {
         }
     }
 
-    // 7. Edge glow (emissive golden border at selected hex) — visible with grid off
+    // 7. Distance to selected hex edge (for glow, dark seam, shadow band)
     vec3 glow_color = vec3(1.0, 0.8, 0.3);
     float dist_to_sel_edge = 0.0;
+    float signed_dist_sel_edge = 0.0; // positive inside, negative outside
     if (has_selection) {
         float hex_radius = hex_size * 0.5;
         vec2 d_sel = abs(v_world_pos.xz - selected_hex_center);
@@ -209,8 +242,33 @@ void fragment() {
         float d2 = abs(dot(d_sel, vec2(SQRT_3/2.0, 0.5)));
         float dist_from_sel_center = max(d1, d2);
         dist_to_sel_edge = abs(hex_radius - dist_from_sel_center);
+        signed_dist_sel_edge = hex_radius - dist_from_sel_center;
     }
     float glow = glow_fade * exp(-pow(dist_to_sel_edge / 40.0, 2.0)) * (0.85 + 0.15 * sin(TIME * 2.0));
+
+    // 7b. Dark seam (carved-with-knife): narrow band at hex edge = cut line, tint dark/brown
+    const float GAP_SEAM_WIDTH = 22.0;
+    vec3 seam_color = vec3(0.18, 0.14, 0.10); // dark earth
+    float seam_mix = 0.0;
+    if (is_selected && dist_to_sel_edge < GAP_SEAM_WIDTH) {
+        seam_mix = 1.0 - smoothstep(0.0, GAP_SEAM_WIDTH, dist_to_sel_edge);
+        seam_mix *= tint_fade;
+    }
+    base_col = mix(base_col, seam_color, seam_mix * 0.7);
+
+    // 7c. Underside tint (ramp = bottom of lifted sod): earth tone on the slope
+    float ramp_factor = 1.0 - v_plateau_shape;
+    vec3 underside_color = vec3(0.22, 0.18, 0.12);
+    if (is_selected && ramp_factor > 0.02) {
+        float underside_mix = ramp_factor * tint_fade * 0.5;
+        base_col = mix(base_col, underside_color, underside_mix);
+    }
+
+    // 7d. Shadow band: terrain just outside selected hex is darker (soft shadow under lifted piece)
+    if (has_selection && !is_selected && signed_dist_sel_edge < 0.0 && dist_to_sel_edge < 60.0) {
+        float shadow_band = 1.0 - smoothstep(0.0, 60.0, dist_to_sel_edge);
+        base_col *= mix(1.0, 0.78, shadow_band * darken_fade);
+    }
 
     // 8. Grid lines (only when show_grid)
     float line_alpha = 0.0;
@@ -229,6 +287,43 @@ void fragment() {
 
     // 9. Composite
     vec3 final_albedo = base_col;
+    vec3 final_emission = glow_color * glow;
+    float hex_radius_9 = hex_size * 0.5;
+    float dist_from_sel_center = hex_radius_9 - signed_dist_sel_edge; // for cast-shadow gradient
+
+    // Ground under the piece: terrain visible but in shadow so you can distinguish it (hovering feel)
+    const float GAP_BAND_IN = 48.0;
+    const float GAP_BAND_OUT = 58.0;
+    float band_smooth = 1.0 - smoothstep(GAP_BAND_IN, GAP_BAND_OUT, dist_to_sel_edge);
+    bool in_cutout = (v_is_selected > 0.5 && v_in_void > 0.5);
+    bool in_band = (has_selection && !is_selected && signed_dist_sel_edge < 0.0 && dist_to_sel_edge < GAP_BAND_OUT);
+    float in_depth_face = (is_selected && v_plateau_shape > 0.0 && v_plateau_shape < 0.5) ? 1.0 : 0.0;
+    float ground_shadow_mask = float(in_cutout) + float(in_band) * band_smooth + in_depth_face;
+    ground_shadow_mask = min(ground_shadow_mask, 1.0);
+
+    if (ground_shadow_mask > 0.001) {
+        // Terrain beneath visible (darkened) so the map feels continuous and the piece hovers above it
+        vec3 terrain_in_shadow = base_col * 0.42;
+        // Soft cast shadow: darker under the center of the piece, lighter toward the edge
+        float cast_shadow = 1.0 - smoothstep(0.0, hex_radius_9 * 0.55, dist_from_sel_center);
+        terrain_in_shadow *= (1.0 - 0.35 * cast_shadow);
+        vec3 ground_col = mix(base_col, terrain_in_shadow, ground_shadow_mask);
+        ground_col = mix(ground_col, fog_color, fog_factor * 0.25);
+        final_albedo = mix(final_albedo, ground_col, ground_shadow_mask);
+        final_emission = mix(final_emission, vec3(0.0), ground_shadow_mask);
+        line_alpha *= (1.0 - ground_shadow_mask);
+    }
+
+    // One smooth, geometric hex outline at the edge (reduces raggedness, reads as clean border)
+    const float OUTLINE_WIDTH = 20.0;
+    const float OUTLINE_SMOOTH = 6.0;
+    float outline = 0.0;
+    if (has_selection && dist_to_sel_edge < OUTLINE_WIDTH + OUTLINE_SMOOTH) {
+        outline = 1.0 - smoothstep(OUTLINE_WIDTH - OUTLINE_SMOOTH, OUTLINE_WIDTH + OUTLINE_SMOOTH, dist_to_sel_edge);
+    }
+    vec3 outline_color = vec3(0.12, 0.10, 0.07);
+    final_albedo = mix(final_albedo, outline_color, outline * 0.5);
+
     if (is_hovered && !is_selected) {
         final_albedo = mix(final_albedo, highlight_color.rgb, hover_fill_alpha);
     }
@@ -239,11 +334,10 @@ void fragment() {
         final_albedo = mix(final_albedo, grid_color.rgb, grid_color.a * line_alpha);
     }
 
-    // Cap albedo to prevent blowout from any additive tint
     final_albedo = min(final_albedo, vec3(1.5));
 
     ALBEDO = final_albedo;
-    EMISSION = glow_color * glow;
+    EMISSION = final_emission;
     ROUGHNESS = roughness;
     METALLIC = metallic;
     RIM = rim;

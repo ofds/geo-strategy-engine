@@ -410,6 +410,17 @@ func _update_hex_grid_interaction() -> void:
 		terrain_material.set_shader_parameter("selection_time", _selection_time)
 		terrain_material.set_shader_parameter("selected_hex_center", _selected_hex_center)
 		
+		# Selection info label (inspection: show selected hex coords)
+		if _selected_hex_center.x < 900000.0:
+			var width = Constants.HEX_SIZE_M
+			var size_axial = width / sqrt(3.0)
+			var q = (2.0 / 3.0 * _selected_hex_center.x) / size_axial
+			var r = (-1.0 / 3.0 * _selected_hex_center.x + sqrt(3.0) / 3.0 * _selected_hex_center.y) / size_axial
+			var sel_axial = _axial_round(Vector2(q, r))
+			_update_selection_label(int(sel_axial.x), int(sel_axial.y))
+		else:
+			_hide_selection_label()
+		
 		# Update Hovered Hex
 		var mouse_pos = get_viewport().get_mouse_position()
 		var space_state = get_world_3d().direct_space_state
@@ -474,6 +485,7 @@ func _update_hex_grid_interaction() -> void:
 var _grid_visible: bool = true
 var _f1_pressed_last_frame: bool = false
 var _debug_label: Label = null
+var _selection_label: Label = null
 
 
 func _find_chunk_recursive(node: Node) -> MeshInstance3D:
@@ -524,3 +536,19 @@ func _update_debug_label(q: int, r: int) -> void:
 func _hide_debug_label() -> void:
 	if _debug_label:
 		_debug_label.visible = false
+
+
+func _update_selection_label(q: int, r: int) -> void:
+	if not _selection_label:
+		_selection_label = Label.new()
+		_selection_label.position = Vector2(20, 52)
+		_selection_label.add_theme_font_size_override("font_size", 20)
+		_selection_label.add_theme_color_override("font_color", Color(0.95, 0.85, 0.4))
+		add_child(_selection_label)
+	_selection_label.text = "Selected: (%d, %d)" % [q, r]
+	_selection_label.visible = true
+
+
+func _hide_selection_label() -> void:
+	if _selection_label:
+		_selection_label.visible = false
