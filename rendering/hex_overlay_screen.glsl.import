@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://5wx1duou7gnf"
+path="res://.godot/imported/hex_overlay_screen.glsl-848dab4d90a4eabac98519e890199e59.res"
+
+[deps]
+
+source_file="res://rendering/hex_overlay_screen.glsl"
+dest_files=["res://.godot/imported/hex_overlay_screen.glsl-848dab4d90a4eabac98519e890199e59.res"]
+
+[params]
+

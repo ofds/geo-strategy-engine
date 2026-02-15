@@ -60,29 +60,10 @@ func _ready() -> void:
 	var shader_material = ShaderMaterial.new()
 	shader_material.shader = shader
 	
-	# Set default params (terrain only; hex overlay on next_pass)
+	# Set default params (terrain only; hex overlay is screen-space compositor, not next_pass)
 	shader_material.set_shader_parameter("albedo", Color(0.3, 0.5, 0.2)) # Base green
 	shader_material.set_shader_parameter("roughness", 0.9)
-
-	# Hex overlay as next_pass (grid, hover, selection cutout); same mesh, renders on top
-	var hex_shader = load("res://rendering/hex_grid.gdshader")
-	if hex_shader:
-		var hex_material = ShaderMaterial.new()
-		hex_material.shader = hex_shader
-		hex_material.render_priority = 1
-		hex_material.set_shader_parameter("hex_size", Constants.HEX_SIZE_M)
-		hex_material.set_shader_parameter("show_grid", Constants.GRID_DEFAULT_VISIBLE)
-		hex_material.set_shader_parameter("grid_fade_start", Constants.GRID_FADE_START_M)
-		hex_material.set_shader_parameter("grid_fade_end", Constants.GRID_FADE_END_M)
-		shader_material.next_pass = hex_material
-		print("TerrainLoader: Hex overlay (next_pass) attached.")
-		if DEBUG_HEX_GRID:
-			print("[HEX] Hex overlay shader loaded: %s" % (hex_shader != null))
-			print("[HEX] Hex material created: %s" % (hex_material != null))
-			print("[HEX] Set as next_pass on terrain material: %s" % (shader_material.next_pass != null))
-			print("[HEX] hex_size=%s show_grid=%s grid_fade_start=%s grid_fade_end=%s" % [Constants.HEX_SIZE_M, Constants.GRID_DEFAULT_VISIBLE, Constants.GRID_FADE_START_M, Constants.GRID_FADE_END_M])
-	else:
-		push_warning("TerrainLoader: hex_grid.gdshader not found; hex overlay disabled.")
+	shader_material.next_pass = null
 
 	# Overview texture: same world extent as chunk grid (origin 0,0); used for continental color at high altitude
 	var overview_path: String = terrain_metadata.get("overview_texture", "")
@@ -112,12 +93,12 @@ func _ready() -> void:
 		shader_material.set_shader_parameter("use_overview", false)
 
 	shared_terrain_material = shader_material
-	# LOD 2+ material: same terrain, no hex next_pass (avoids overlay on coarse chunks; grid only on LOD 0-1).
+	# LOD 2+ material: same terrain, no next_pass (hex overlay is screen-space compositor for all LODs).
 	var mat_lod2plus: ShaderMaterial = shader_material.duplicate(true) as ShaderMaterial
 	mat_lod2plus.next_pass = null
 	shared_terrain_material_lod2plus = mat_lod2plus
 	add_to_group("terrain_loader")
-	print("TerrainLoader: Unified terrain shader loaded (LOD 0-1 with hex overlay, LOD 2+ without).")
+	print("TerrainLoader: Unified terrain shader loaded (hex overlay via screen-space compositor).")
 
 
 ## Load a single chunk and return a complete Node3D with mesh and collision

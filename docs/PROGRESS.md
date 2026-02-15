@@ -117,6 +117,10 @@
 - **Enhancement ideas (Task B1):** "Hex Selection Enhancement Ideas" added to backlog in PROGRESS.md: particles, god rays, energy line, slice shadow, slice saturation, rim pulse, ripple, neighbor dimming — with difficulty, cost, and aesthetic notes.
 - **Two enhancements implemented (Task B2):** (1) Slice surface gets subtle warm emission when lifted (StandardMaterial3D emission driven by lift factor in hex_selector `_process`). (2) Golden rim glow in hex_grid.gdshader uses a clearer pulse (0.7 + 0.3*sin(TIME*1.5)) so the selection "breathes".
 
+## 🟢 Fixed Issues
+
+- **Hex grid doubling/see-through (Feb 15, 2026):** Replaced `next_pass` overlay with screen-space compositor effect. Grid now renders in a single fullscreen compute pass using depth buffer reconstruction. Guarantees single draw per pixel, depth-correct rendering. Files: `rendering/hex_overlay_screen.glsl`, `rendering/hex_overlay_compositor.gd`. Old `hex_grid.gdshader` archived.
+
 ## 📋 Backlog — Bugs & Polish
 
 ### 🟡 Known Issues

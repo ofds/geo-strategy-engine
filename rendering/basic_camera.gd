@@ -3,6 +3,8 @@ extends Camera3D
 ## Features: WASD pan, scroll zoom, middle mouse orbit
 ## Stays above terrain at all times
 
+const HexOverlayCompositorScript = preload("res://rendering/hex_overlay_compositor.gd")
+
 # Camera state
 var target_position: Vector3 = Vector3.ZERO # Point camera looks at
 var orbit_distance: float = 10000.0 # Distance from target (altitude)
@@ -244,13 +246,15 @@ func _update_debug_visuals(hit_pos: Vector3, center_pos: Vector3) -> void:
 var _selected_hex_center: Vector2 = Vector2(999999, 999999)
 var _selection_time: float = 0.0 # Seconds since selection; animates lift/border/tint
 
+# Screen-space hex overlay (CompositorEffect); set in _ensure_hex_compositor() from world environment compositor
+var _hex_compositor: CompositorEffect = null
+
 func _update_hex_selection_uniform() -> void:
-	var hex_mat = _get_hex_overlay_material()
-	if hex_mat:
-		hex_mat.set_shader_parameter("selected_hex_center", _selected_hex_center)
-		hex_mat.set_shader_parameter("selection_time", _selection_time)
+	if _hex_compositor:
+		_hex_compositor.selected_hex_center = _selected_hex_center
+		_hex_compositor.selection_time = _selection_time
 	elif DEBUG_DIAGNOSTIC:
-		print("DEBUG: Could not find hex overlay material to update selection!")
+		print("DEBUG: Hex overlay compositor not found to update selection!")
 
 
 func _process(delta: float) -> void:
@@ -415,7 +419,7 @@ func _update_camera_transform() -> void:
 	# Look at target
 	look_at(target_position, Vector3.UP)
 	
-	# Update Hex Grid Uniforms and Interaction
+	# Update hex overlay (compositor) and terrain material uniforms
 	_update_hex_grid_interaction()
 
 
@@ -435,25 +439,33 @@ func _get_terrain_material() -> ShaderMaterial:
 	return null
 
 
-func _get_hex_overlay_material() -> ShaderMaterial:
-	# Prefer TerrainLoader's LOD 0-1 material (has next_pass) so hex params always apply.
-	var loader = get_tree().get_first_node_in_group("terrain_loader")
-	if loader and loader is TerrainLoader:
-		var with_overlay: Material = loader.shared_terrain_material
-		if with_overlay and with_overlay is ShaderMaterial and (with_overlay as ShaderMaterial).next_pass is ShaderMaterial:
-			return (with_overlay as ShaderMaterial).next_pass
-	var terrain_mat = _get_terrain_material()
-	if terrain_mat and terrain_mat.next_pass is ShaderMaterial:
-		return terrain_mat.next_pass
-	return null
+func _ensure_hex_compositor() -> void:
+	if _hex_compositor != null:
+		return
+	var world_env: WorldEnvironment = get_parent().get_node_or_null("WorldEnvironment") as WorldEnvironment
+	if not world_env:
+		return
+	# Compositor is on WorldEnvironment; effects are in compositor_effects array
+	var comp: Compositor = world_env.compositor
+	if comp == null:
+		world_env.compositor = Compositor.new()
+		comp = world_env.compositor
+	var effects: Array = comp.get_compositor_effects()
+	for e in effects:
+		if e != null and e.get_script() == HexOverlayCompositorScript:
+			_hex_compositor = e
+			return
+	_hex_compositor = HexOverlayCompositorScript.new()
+	effects.append(_hex_compositor)
+	comp.set_compositor_effects(effects)
 
 
 func _update_hex_grid_interaction() -> void:
 	var alt_uniform: float = orbit_distance if orbit_distance > 0.0 else position.y
 	var terrain_materials: Array[ShaderMaterial] = []
-	var hex_mat: ShaderMaterial = _get_hex_overlay_material()
+	_ensure_hex_compositor()
 
-	# When using two-materials fallback, update both terrain materials (LOD 0-1 and LOD 2+).
+	# Update terrain materials only (no hex — hex is now screen-space compositor)
 	var loader = get_tree().get_first_node_in_group("terrain_loader")
 	if loader and loader is TerrainLoader:
 		if loader.shared_terrain_material is ShaderMaterial:
@@ -465,12 +477,9 @@ func _update_hex_grid_interaction() -> void:
 		if single:
 			terrain_materials.append(single)
 
-	# [HEX] first-frame diagnostic (DEBUG_DIAGNOSTIC only)
-	if DEBUG_DIAGNOSTIC and not _hex_diag_printed and hex_mat:
+	if DEBUG_DIAGNOSTIC and not _hex_diag_printed and _hex_compositor:
 		_hex_diag_printed = true
-		var show_val = hex_mat.get_shader_parameter("show_grid")
-		var hover_val = hex_mat.get_shader_parameter("hovered_hex_center")
-		print("[HEX] Frame update: altitude=%.1f show_grid=%s hovered_hex_center=%s" % [alt_uniform, show_val, hover_val])
+		print("[HEX] Frame update: altitude=%.1f show_grid=%s (compositor)" % [alt_uniform, _hex_compositor.show_grid])
 
 	for terrain_material in terrain_materials:
 		terrain_material.set_shader_parameter("altitude", alt_uniform)
@@ -478,11 +487,12 @@ func _update_hex_grid_interaction() -> void:
 		terrain_material.set_shader_parameter("terrain_center_xz", _terrain_center_xz)
 		terrain_material.set_shader_parameter("terrain_radius_m", _terrain_radius_m)
 
-	if hex_mat:
-		hex_mat.set_shader_parameter("altitude", alt_uniform)
-		hex_mat.set_shader_parameter("camera_position", position)
-		hex_mat.set_shader_parameter("selection_time", _selection_time)
-		hex_mat.set_shader_parameter("selected_hex_center", _selected_hex_center)
+	if _hex_compositor:
+		_hex_compositor.altitude = alt_uniform
+		_hex_compositor.camera_position = position
+		_hex_compositor.selection_time = _selection_time
+		_hex_compositor.selected_hex_center = _selected_hex_center
+		_hex_compositor.show_grid = _grid_visible
 
 	var overview_node = get_tree().get_first_node_in_group("overview_plane")
 	if overview_node and overview_node is MeshInstance3D:
@@ -519,26 +529,26 @@ func _update_hex_grid_interaction() -> void:
 				var hex_r = int(hex_axial.y)
 				var center_x = hex_size * (3.0 / 2.0 * hex_q)
 				var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
-				if hex_mat:
-					hex_mat.set_shader_parameter("hovered_hex_center", Vector2(center_x, center_z))
+				if _hex_compositor:
+					_hex_compositor.hovered_hex_center = Vector2(center_x, center_z)
 				_update_debug_visuals(hit_pos, Vector3(center_x, hit_pos.y, center_z))
 				_update_debug_label(hex_q, hex_r)
 			else:
 				_hide_debug_label()
-				if hex_mat:
-					hex_mat.set_shader_parameter("hovered_hex_center", Vector2(999999.0, 999999.0))
+				if _hex_compositor:
+					_hex_compositor.hovered_hex_center = Vector2(-999999.0, -999999.0)
 
 		if Input.is_key_pressed(KEY_F1):
 			if not _f1_pressed_last_frame:
 				_grid_visible = not _grid_visible
-				if hex_mat:
-					hex_mat.set_shader_parameter("show_grid", _grid_visible)
+				if _hex_compositor:
+					_hex_compositor.show_grid = _grid_visible
 				_f1_pressed_last_frame = true
 		else:
 			_f1_pressed_last_frame = false
 
 
-var _grid_visible: bool = true
+var _grid_visible: bool = Constants.GRID_DEFAULT_VISIBLE
 var _f1_pressed_last_frame: bool = false
 var _debug_label: Label = null
 var _selection_label: Label = null
