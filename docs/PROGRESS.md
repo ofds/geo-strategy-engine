@@ -1,32 +1,30 @@
 # GeoStrategy Engine - Progress Tracker
 
-**Last Updated:** February 14, 2026
+**Last Updated:** February 15, 2026
 
 ## 📂 Project Structure & Key Files
 
 | File | Status | Description |
 |------|--------|-------------|
-| **`core/terrain_loader.gd`** | ✅ Stable | Stateless utility. Loads 16-bit PNGs, generates decimated meshes (LOD 0-4), handles collision & materials. |
+| **`core/terrain_loader.gd`** | ✅ Stable | Stateless utility. Loads 16-bit PNGs via raw PNG parse (bypasses Godot 8-bit downcast), decimated meshes (LOD 0-4), collision & materials. |
 | **`core/chunk_manager.gd`** | ✅ Stable | Dynamic streaming system. Manages load/unload queues, LOD hysteresis, and distance-based priority. |
 | **`rendering/basic_camera.gd`** | ✅ Stable | Orbital camera (WASD/Zoom/Orbit) with terrain collision avoidance and speed boosting. |
 | **`scenes/terrain_demo.tscn`** | ✅ Stable | Main entry point. Contains the chunk manager, camera, and lighting setup. |
 | **`ui/loading_screen.gd`** | ✅ Stable | Simple progress bar for initial bulk chunk loading. |
 | `config/constants.gd` | ✅ Stable | Global configuration (LOD distances, chunk sizes, memory budgets). |
 | `tools/process_terrain.py` | ✅ Stable | Python CLI pipeline. Downloads SRTM data, merges, and tiles into 512px 16-bit PNGs. |
-| **`rendering/hex_overlay.gdshader`** | ✅ Stable | Procedural hex grid shader with altitude fading and interaction. |
+| **`rendering/hex_overlay.gdshader`** | ⚠️ Deprecated | Previous overlay approach. Replaced by unified `terrain.gdshader`. |
+| **`rendering/terrain.gdshader`** | ✅ Stable | **Unified Shader**. Height/slope terrain coloring, distance fog, hex grid overlay, selection lift. |
 
-## 🚀 Current System Status (Phase 5 Complete)
+## 🚀 Current System Status (Phase 7 Complete)
 
-The **Dynamic Chunk Streaming** system is fully operational, now with a **Hex Grid Overlay**.
-
-*   **Streaming**: Loads up to 8 chunks/sec based on camera position.
-*   **LOD System**: 5 levels (LOD 0-4) with hysteresis.
-*   **Hex Grid Overlay**:
-    *   Shader-based projection on terrain (no extra geometry).
-    *   1km flat-top hexes.
-    *   Fades out between 5km and 20km altitude.
-    *   Mouse hover highlight & coordinate debug label.
-    *   Toggle with **F1**.
+*   **16-bit elevation**: Terrain loader parses PNG via FileAccess (IHDR/IDAT, zlib/deflate, PNG row filters) so elevation uses full 16-bit range—smooth slopes, no staircase banding.
+*   **Terrain coloring**: Shader colors by elevation (lowland green → foothills → alpine → rock → snow) with ~200m smoothstep transitions, plus steep-slope rock override (normal.y &lt; 0.7).
+*   **Distance fog**: Fog from 50km to 200km (blue-gray), camera position passed from `basic_camera.gd` each frame.
+*   **Unified shader**: Single-pass terrain + hex grid; grid lines, hover, and selection raise unchanged on top of colored terrain.
+*   **Known issues**:
+    *   **LOD Deformation**: Hex shapes distorted on high-LOD (low-res) chunks.
+    *   **Fade Tuning**: Hex grid visibility at zoom could be refined.
 
 ## 📊 Current Performance Benchmarks
 
@@ -35,19 +33,18 @@ The **Dynamic Chunk Streaming** system is fully operational, now with a **Hex Gr
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **FPS** | **100 - 180+** | Minimal impact from hex shader. |
-| **Draw Calls** | **~55** | Stable. |
-| **Loaded Chunks** | **44 - 48** | Stable count. |
+| **FPS** | **120 - 180+** | Excellent performance (Single-pass is faster than overlay). |
+| **Draw Calls** | **~55** | Minimal overhead. |
+| **Loaded Chunks** | **44 - 48** | Stable. |
 
 ## 📋 Backlog
 
 ### 🔴 High Priority
-*   **16-bit PNG Precision Loss**: Godot imports 16-bit PNGs as 8-bit, causing "stair-stepping" on gentle slopes.
-    *   *Fix*: Write a custom importer using `FileAccess` to read raw 16-bit bytes directly (bypass Godot `Image.load`).
+*   **LOD-Independent Overlay**: Investigate Decals or a separate high-res grid mesh to fix hex deformation on low-LOD terrain.
 
 ## 🔮 What To Do Next
 
-1.  **Terrain Coloring**: Replace debug green material with slope/height-based shader.
+1.  **Texture Splatting**: Add texture detail on top of current height/slope coloring (optional).
 2.  **Hex Data Layer**: Attach gameplay data to hexes (biome, owner, unit count).
 
 ## ⚡ Quick Start
@@ -60,9 +57,3 @@ The **Dynamic Chunk Streaming** system is fully operational, now with a **Hex Gr
     *   **Middle Mouse**: Orbit.
     *   **Left Click**: Select Hex (Pop-up).
     *   **F1**: Toggle Hex Grid.
-
-> **Note:** Fixed hex coordinate offset. Selection now highlights the exact hex under cursor.
-> **Note:** Fixed "x-ray" artifacts by re-enabling depth testing and using a 2.0m vertex offset.
-
-
-

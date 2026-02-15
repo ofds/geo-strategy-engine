@@ -91,6 +91,11 @@ func _input(event: InputEvent) -> void:
 			_zoom(-1)
 		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
 			_zoom(1)
+			
+		# Mouse Click - Hex Selection
+		elif event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
+			print("DEBUG: Left Click Detected at ", event.position)
+			_handle_hex_selection_click(event.position)
 	
 	# Mouse motion - orbit when middle button held
 	elif event is InputEventMouseMotion:
@@ -105,13 +110,6 @@ func _input(event: InputEvent) -> void:
 			orbit_pitch = clamp(orbit_pitch, 10.0, 89.0)
 			
 			_update_camera_transform()
-
-	# Mouse Click - Hex Selection
-	elif event is InputEventMouseButton:
-		if event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
-			_handle_hex_selection_click(event.position)
-
-
 func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 	# Raycast to find clicked hex
 	var space_state = get_world_3d().direct_space_state
@@ -141,34 +139,74 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 		var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
 		var center = Vector2(center_x, center_z)
 		
+		print("DEBUG: Clicked Hex (%d, %d) Center: %s" % [hex_q, hex_r, center])
+		
 		# Toggle selection
 		if _selected_hex_center.distance_to(center) < 1.0:
 			# Deselect if clicking same hex
+			print("DEBUG: Deselecting")
 			_selected_hex_center = Vector2(999999, 999999)
 		else:
 			# Select new hex
+			print("DEBUG: Selecting new hex")
 			_selected_hex_center = center
-			# Signal or print for now
-			print("Hex Selected: (%d, %d)" % [hex_q, hex_r])
 	else:
 		# Clicked sky/nothing -> Deselect
+		print("DEBUG: Clicked Sky -> Deselecting")
 		_selected_hex_center = Vector2(999999, 999999)
 	
 	# Update Shader immediately
 	_update_hex_selection_uniform()
 
 
+# DEBUG VISUALS
+var debug_hit_sphere: MeshInstance3D = null
+var debug_center_sphere: MeshInstance3D = null
+
+func _update_debug_visuals(hit_pos: Vector3, center_pos: Vector3) -> void:
+	if not debug_hit_sphere:
+		debug_hit_sphere = MeshInstance3D.new()
+		var sphere = SphereMesh.new()
+		sphere.radius = 20.0
+		sphere.height = 40.0
+		var mat = StandardMaterial3D.new()
+		mat.albedo_color = Color(1, 0, 0) # Red = Hit
+		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		sphere.material = mat
+		debug_hit_sphere.mesh = sphere
+		get_tree().root.add_child(debug_hit_sphere)
+		
+	if not debug_center_sphere:
+		debug_center_sphere = MeshInstance3D.new()
+		var sphere = SphereMesh.new()
+		sphere.radius = 30.0
+		sphere.height = 60.0
+		var mat = StandardMaterial3D.new()
+		mat.albedo_color = Color(0, 1, 0) # Green = Center
+		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		sphere.material = mat
+		debug_center_sphere.mesh = sphere
+		get_tree().root.add_child(debug_center_sphere)
+
+	debug_hit_sphere.global_position = hit_pos
+	debug_center_sphere.global_position = center_pos
+	debug_hit_sphere.visible = true
+	debug_center_sphere.visible = true
+
+
 var _selected_hex_center: Vector2 = Vector2(999999, 999999)
 
 func _update_hex_selection_uniform() -> void:
+	# ... existing code ...
 	# Find material (reusing logic from _update_hex_grid_interaction or caching it would be better)
 	# For now, quick lookup same as before
 	var terrain_material: ShaderMaterial = null
 	var chunk = get_tree().get_first_node_in_group("terrain_chunks")
 	if chunk and chunk is MeshInstance3D:
 		var mat = chunk.get_surface_override_material(0)
-		if mat and mat.next_pass is ShaderMaterial:
-			terrain_material = mat.next_pass
+		# UNIFIED SHADER FLIP: The material IS the ShaderMaterial now, not next_pass
+		if mat is ShaderMaterial:
+			terrain_material = mat
 	
 	# Fallback search
 	if not terrain_material:
@@ -177,11 +215,14 @@ func _update_hex_selection_uniform() -> void:
 			var node = _find_chunk_recursive(root)
 			if node:
 				var mat = node.get_surface_override_material(0)
-				if mat and mat.next_pass is ShaderMaterial:
-					terrain_material = mat.next_pass
+				if mat is ShaderMaterial:
+					terrain_material = mat
 	
 	if terrain_material:
+		print("DEBUG: Setting 'selected_hex_center' uniform to ", _selected_hex_center)
 		terrain_material.set_shader_parameter("selected_hex_center", _selected_hex_center)
+	else:
+		print("DEBUG: Could not find terrain material to update selection!")
 
 
 func _process(delta: float) -> void:
@@ -341,23 +382,24 @@ func _update_hex_grid_interaction() -> void:
 	var chunk = get_tree().get_first_node_in_group("terrain_chunks")
 	if chunk and chunk is MeshInstance3D:
 		var mat = chunk.get_surface_override_material(0)
-		if mat and mat.next_pass is ShaderMaterial:
-			terrain_material = mat.next_pass
+		if mat is ShaderMaterial:
+			terrain_material = mat
 	
 	# fallback: try to find by name pattern if group not set
 	if not terrain_material:
-		# slower search
 		var root = get_tree().root
 		if root:
 			var node = _find_chunk_recursive(root)
 			if node:
 				var mat = node.get_surface_override_material(0)
-				if mat and mat.next_pass is ShaderMaterial:
-					terrain_material = mat.next_pass
+				if mat is ShaderMaterial:
+					terrain_material = mat
 	
 	if terrain_material:
 		# Update Altitude
 		terrain_material.set_shader_parameter("altitude", position.y)
+		# Fog: pass camera position to shader
+		terrain_material.set_shader_parameter("camera_position", position)
 		
 		# Update Hovered Hex
 		var mouse_pos = get_viewport().get_mouse_position()
@@ -398,18 +440,16 @@ func _update_hex_grid_interaction() -> void:
 			var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
 			
 			# Pass to Shader
-			terrain_material.set_shader_parameter("hovered_hex_center", Vector2(center_x, center_z))
+			if terrain_material:
+				terrain_material.set_shader_parameter("hovered_hex_center", Vector2(center_x, center_z))
 			
-			# Debug Print (temporary, remove if spammy)
-			# print("Hit: (%.1f, %.1f) -> Hex: (%d, %d) -> Center: (%.1f, %.1f) -> Dist: %.1f" % 
-			# 	[hit_pos.x, hit_pos.z, hex_q, hex_r, center_x, center_z, 
-			# 	Vector2(hit_pos.x, hit_pos.z).distance_to(Vector2(center_x, center_z))])
+			# Debug Visuals
+			_update_debug_visuals(hit_pos, Vector3(center_x, hit_pos.y, center_z))
 			
 			# Show Debug Label
 			_update_debug_label(hex_q, hex_r)
 		else:
-			# No hit, maybe hide highlight?
-			# terrain_material.set_shader_parameter("hovered_hex_center", Vector2(999999, 999999)) # Move off screen
+			# No hit
 			_hide_debug_label()
 			
 		# Toggle Visibility F1

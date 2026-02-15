@@ -20,7 +20,7 @@ const LOD_MESH_RESOLUTION: Array[int] = [
 ]
 
 # SHARED MATERIAL: One material for all chunks to enable draw call batching
-var shared_terrain_material: StandardMaterial3D = null
+var shared_terrain_material: Material = null
 
 
 func _ready() -> void:
@@ -29,36 +29,24 @@ func _ready() -> void:
 		push_error("TerrainLoader: Failed to load terrain metadata!")
 		return
 	
-	# Create SHARED material for all chunks (enables draw call batching)
-	shared_terrain_material = StandardMaterial3D.new()
-	shared_terrain_material.albedo_color = Color(0.4, 0.6, 0.3) # Greenish terrain color
-	shared_terrain_material.roughness = 0.9
-	shared_terrain_material.metallic = 0.0
-	shared_terrain_material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
-	shared_terrain_material.cull_mode = BaseMaterial3D.CULL_DISABLED # Render both sides
+	# Create SHARED material for allchunks using the UNIFIED shader
+	var shader = load("res://rendering/terrain.gdshader")
+	if not shader:
+		push_error("TerrainLoader: Failed to load unified terrain shader!")
+		return
+		
+	var shader_material = ShaderMaterial.new()
+	shader_material.shader = shader
 	
-	# Add subtle rim lighting to help with faceting
-	shared_terrain_material.rim_enabled = true
-	shared_terrain_material.rim = 0.15
-	shared_terrain_material.rim_tint = 0.3
+	# Set default params
+	shader_material.set_shader_parameter("albedo", Color(0.3, 0.5, 0.2)) # Base green
+	shader_material.set_shader_parameter("roughness", 0.9)
+	shader_material.set_shader_parameter("hex_size", Constants.HEX_SIZE_M)
+	shader_material.set_shader_parameter("fade_start", Constants.GRID_FADE_START_M)
+	shader_material.set_shader_parameter("fade_end", Constants.GRID_FADE_END_M)
 	
-	# Hex Grid Overlay (Next Pass)
-	var hex_shader = load("res://rendering/hex_overlay.gdshader")
-	if hex_shader:
-		var hex_material = ShaderMaterial.new()
-		hex_material.shader = hex_shader
-		hex_material.render_priority = 1 # Prepare to render on top of terrain
-		
-		# Set initial uniforms from Constants
-		hex_material.set_shader_parameter("hex_size", Constants.HEX_SIZE_M)
-		hex_material.set_shader_parameter("fade_start", Constants.GRID_FADE_START_M)
-		hex_material.set_shader_parameter("fade_end", Constants.GRID_FADE_END_M)
-		
-		
-		shared_terrain_material.next_pass = hex_material
-		print("TerrainLoader: Hex shader loaded and assigned to next_pass. Priority: ", hex_material.render_priority)
-	else:
-		push_error("TerrainLoader: Failed to load hex overlay shader!")
+	shared_terrain_material = shader_material # Reuse variable name but it's now ShaderMaterial
+	print("TerrainLoader: Unified terrain shader loaded.")
 
 
 ## Load a single chunk and return a complete Node3D with mesh and collision
@@ -183,110 +171,159 @@ func _load_metadata() -> bool:
 
 func _load_16bit_heightmap(path: String) -> Array[float]:
 	"""
-	Load 16-bit PNG heightmap. Godot's Image.load() often downcasts to 8-bit.
-	We read raw bytes and parse manually to ensure 16-bit precision.
+	Load 16-bit PNG heightmap. Bypasses Godot's Image.load() which downcasts to 8-bit.
+	Reads raw PNG bytes and extracts true 16-bit grayscale values.
 	"""
-	
 	var heights: Array[float] = []
-	
 	if not FileAccess.file_exists(path):
 		push_error("Heightmap file not found: " + path)
 		return heights
-	
-	# First, try using Image.load() and check if it preserved 16-bit
-	var image = Image.new()
-	var err = image.load(path)
-	
-	if err != OK:
-		push_error("Failed to load image: " + path)
-		return heights
-	
-	# Reduced logging - only log format if there's an issue
-	var format = image.get_format()
-	# print("Image format: %d (L8=3, RH=22)" % format)
-	# print("Image size: %dx%d" % [image.get_width(), image.get_height()])
-	
-	# Check if Godot preserved the format
-	# Image.FORMAT_L8 = 3 (8-bit grayscale)
-	# Image.FORMAT_RH = 22 (16-bit half-float)
-	# Image.FORMAT_R16 is not available in Godot 4.x
-	
-	if format == Image.FORMAT_L8:
-		push_warning("Image was loaded as 8-bit! Attempting manual 16-bit parse...")
-		# Try to read raw PNG bytes
-		heights = _parse_16bit_png_manual(path)
-		if heights.is_empty():
-			# Fall back to 8-bit but warn loudly
-			push_error("CRITICAL: 16-bit loading failed! Using degraded 8-bit data!")
+	heights = _parse_16bit_png_raw(path)
+	if heights.is_empty():
+		# Fallback: try Image and 8-bit (degraded)
+		var image = Image.new()
+		if image.load(path) == OK and image.get_format() == Image.FORMAT_L8:
+			push_error("CRITICAL: 16-bit PNG parse failed! Using degraded 8-bit data.")
 			heights = _extract_heights_from_8bit(image)
-	else:
-		# If format is not L8, try to extract data
-		# Note: Godot may load as RH (half-float) or another format
-		heights = _extract_heights_from_image(image)
-	
-	# Verify we got the right number of pixels
 	var expected_pixels = chunk_size_px * chunk_size_px
 	if heights.size() != expected_pixels:
 		push_error("Pixel count mismatch! Expected %d, got %d" % [expected_pixels, heights.size()])
 		return []
-	
 	return heights
 
 
-func _parse_16bit_png_manual(path: String) -> Array[float]:
+func _parse_16bit_png_raw(path: String) -> Array[float]:
 	"""
-	Manually parse PNG file to extract 16-bit grayscale data.
-	This is a workaround for Godot's Image class downsampling to 8-bit.
+	Parse PNG file via FileAccess: read raw bytes, find IHDR/IDAT, decompress,
+	apply PNG row filters, and extract 16-bit big-endian grayscale values.
 	"""
-	
 	var heights: Array[float] = []
-	
 	var file = FileAccess.open(path, FileAccess.READ)
 	if not file:
 		push_error("Cannot open file for raw reading: " + path)
 		return heights
-	
-	# Read entire file
 	var file_bytes = file.get_buffer(file.get_length())
 	file.close()
-	
-	# Parse PNG structure
-	# PNG signature: 89 50 4E 47 0D 0A 1A 0A
+	# PNG signature
 	if file_bytes.size() < 8:
 		push_error("File too small to be PNG")
 		return heights
-	
 	var png_sig = PackedByteArray([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
 	for i in range(8):
 		if file_bytes[i] != png_sig[i]:
 			push_error("Invalid PNG signature")
 			return heights
-	
-	# Find IDAT chunk(s) - this is where image data is
-	# For now, use stb_image-style parsing via Image class but force conversion
-	
-	# Alternative: Use Image but convert properly
-	var image = Image.new()
-	image.load(path)
-	
-	# If it's 8-bit, we know each pixel value represents a 16-bit value that was divided by 256
-	# We can multiply back up, but precision is lost
-	if image.get_format() == Image.FORMAT_L8:
-		push_warning("Reconstructing 16-bit from 8-bit with reduced precision")
-		for y in range(chunk_size_px):
-			for x in range(chunk_size_px):
-				var pixel = image.get_pixel(x, y)
-				# L8 stores value in R channel
-				var value_8bit = int(pixel.r * 255.0)
-				# Assume original was scaled from 16-bit: value_16bit / 256 = value_8bit
-				var value_16bit = value_8bit * 256
-				var height_m = (float(value_16bit) / 65535.0) * max_elevation_m
-				heights.append(height_m)
-	else:
-		# Try to interpret other formats
-		heights = _extract_heights_from_image(image)
-	
+	var width: int = 0
+	var height: int = 0
+	var bit_depth: int = 0
+	var color_type: int = 0
+	var idat_data = PackedByteArray()
+	var pos: int = 8
+	while pos + 12 <= file_bytes.size():
+		var chunk_len = (file_bytes[pos] << 24) | (file_bytes[pos + 1] << 16) | (file_bytes[pos + 2] << 8) | file_bytes[pos + 3]
+		var chunk_type = file_bytes.slice(pos + 4, pos + 8)
+		pos += 8
+		if pos + chunk_len + 4 > file_bytes.size():
+			push_error("PNG chunk extends past end of file")
+			return []
+		if chunk_type[0] == 0x49 and chunk_type[1] == 0x48 and chunk_type[2] == 0x44 and chunk_type[3] == 0x52:
+			# IHDR
+			if chunk_len != 13:
+				push_error("IHDR length != 13")
+				return []
+			width = (file_bytes[pos] << 24) | (file_bytes[pos + 1] << 16) | (file_bytes[pos + 2] << 8) | file_bytes[pos + 3]
+			height = (file_bytes[pos + 4] << 24) | (file_bytes[pos + 5] << 16) | (file_bytes[pos + 6] << 8) | file_bytes[pos + 7]
+			bit_depth = file_bytes[pos + 8]
+			color_type = file_bytes[pos + 9]
+		elif chunk_type[0] == 0x49 and chunk_type[1] == 0x44 and chunk_type[2] == 0x41 and chunk_type[3] == 0x54:
+			# IDAT
+			idat_data.append_array(file_bytes.slice(pos, pos + chunk_len))
+		pos += chunk_len + 4
+	if width <= 0 or height <= 0:
+		push_error("PNG IHDR missing or invalid width/height")
+		return []
+	if bit_depth != 16 or color_type != 0:
+		push_error("PNG is not 16-bit grayscale: bit_depth=%d color_type=%d" % [bit_depth, color_type])
+		return []
+	if idat_data.is_empty():
+		push_error("No IDAT chunk found")
+		return []
+	# Zlib: 2-byte header + deflate + 4-byte Adler-32.
+	if idat_data.size() < 6:
+		push_error("IDAT data too short")
+		return []
+	var row_bytes = 1 + width * 2
+	var expected_size = height * row_bytes
+	var decompressed: PackedByteArray
+	# Try raw deflate first (strip zlib header and checksum)
+	var raw_deflate = idat_data.slice(2, idat_data.size() - 4)
+	decompressed = raw_deflate.decompress(expected_size, FileAccess.COMPRESSION_DEFLATE)
+	if decompressed.size() != expected_size:
+		decompressed = raw_deflate.decompress_dynamic(expected_size * 2, FileAccess.COMPRESSION_DEFLATE)
+	# If still no luck, try full zlib stream (some engines expect zlib-wrapped)
+	if decompressed.size() != expected_size:
+		decompressed = idat_data.decompress_dynamic(expected_size * 2, FileAccess.COMPRESSION_DEFLATE)
+	if decompressed.size() != expected_size:
+		push_error("Decompress failed: got %d, expected %d" % [decompressed.size(), expected_size])
+		return []
+	# Parse rows: filter byte + width*2 bytes per row. Apply PNG filter and read 16-bit BE.
+	var bpp: int = 2
+	var prev_row = PackedByteArray()
+	prev_row.resize(width * 2)
+	for i in range(width * 2):
+		prev_row[i] = 0
+	for y in range(height):
+		var row_start = y * row_bytes
+		var filter_type = decompressed[row_start]
+		var row_data = decompressed.slice(row_start + 1, row_start + row_bytes)
+		# Reconstruct filtered bytes into recon row (same size as row_data)
+		var recon = _png_reconstruct_row(filter_type, row_data, prev_row, bpp)
+		prev_row = recon
+		# Read big-endian uint16 per pixel
+		for x in range(width):
+			var hi = recon[x * 2]
+			var lo = recon[x * 2 + 1]
+			var value_16 = (hi << 8) | lo
+			var height_m = (float(value_16) / 65535.0) * max_elevation_m
+			heights.append(height_m)
 	return heights
+
+
+func _png_reconstruct_row(filter_type: int, row: PackedByteArray, prev_row: PackedByteArray, bpp: int) -> PackedByteArray:
+	"""PNG filter reconstruction. row = raw bytes for this row (excl. filter byte). Returns reconstructed row."""
+	var recon = PackedByteArray()
+	recon.resize(row.size())
+	for i in range(row.size()):
+		var x = row[i]
+		var a = recon[i - bpp] if i >= bpp else 0
+		var b = prev_row[i] if i < prev_row.size() else 0
+		var c = prev_row[i - bpp] if (i >= bpp and i < prev_row.size()) else 0
+		if filter_type == 0:
+			recon[i] = x
+		elif filter_type == 1:
+			recon[i] = (x + a) & 0xFF
+		elif filter_type == 2:
+			recon[i] = (x + b) & 0xFF
+		elif filter_type == 3:
+			recon[i] = (x + ((a + b) >> 1)) & 0xFF
+		elif filter_type == 4:
+			var p = _paeth(a, b, c)
+			recon[i] = (x + p) & 0xFF
+		else:
+			recon[i] = x
+	return recon
+
+
+func _paeth(a: int, b: int, c: int) -> int:
+	var p = a + b - c
+	var pa = abs(p - a)
+	var pb = abs(p - b)
+	var pc = abs(p - c)
+	if pa <= pb and pa <= pc:
+		return a
+	if pb <= pc:
+		return b
+	return c
 
 
 func _extract_heights_from_image(image: Image) -> Array[float]:
@@ -520,9 +557,11 @@ func _create_heightmap_collision_lod(heights: Array[float], chunk_x: int, chunk_
 	var chunk_world_size = chunk_size_px * resolution_m * lod_scale
 	
 	# Position collision shape to match the mesh
-	# CRITICAL: HeightMapShape3D is positioned from its MIN corner, same as the mesh!
-	# The mesh is at (world_x, 0, world_z) so collision must be too
-	collision_shape.position = Vector3(world_x, 0, world_z)
+	# CRITICAL: HeightMapShape3D is centered on its local origin!
+	# The mesh is built from (0,0) to (+size, +size) in local space (top-left anchor).
+	# To align a centered shape with a top-left mesh, we must shift the shape by +size/2.
+	var half_size = chunk_world_size * 0.5
+	collision_shape.position = Vector3(world_x + half_size, 0, world_z + half_size)
 	
 	# Scale the collision shape
 	# The spacing between height samples in world units

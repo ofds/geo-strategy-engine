@@ -86,7 +86,7 @@ void vertex() {
     // Check equality
     if (abs(pos_center_axial.x - sel_center_axial.x) < 0.1 && abs(pos_center_axial.y - sel_center_axial.y) < 0.1) {
         v_is_selected = 1.0;
-        VERTEX.y += 50.0; 
+        VERTEX.y += 200.0; // Increased to 200m for visibility
     }
 
     // Offset along normal to prevent z-fighting with the base terrain material

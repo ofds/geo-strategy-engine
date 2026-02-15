@@ -175,12 +175,12 @@ func _update_chunks() -> void:
 	
 	loaded_lod0_count = lod_counts[0]
 	
-	print("\n[DIAGNOSTIC] Update cycle:")
-	print("  Camera XZ: (%.1f, %.1f) - %s" % [camera_pos.x, camera_pos.z, "MOVING" if camera_moved else "STABLE (%d cycles)" % diagnostic_camera_stable_count])
-	print("  Desired LOD 0 chunks: %d" % desired_lod0_count)
-	print("  Loaded LOD 0 chunks: %d" % loaded_lod0_count)
-	print("  Loaded: %d total (LOD0=%d, LOD1=%d, LOD2=%d, LOD3=%d, LOD4=%d)" %
-		[loaded_chunks.size(), lod_counts[0], lod_counts[1], lod_counts[2], lod_counts[3], lod_counts[4]])
+	# print("\n[DIAGNOSTIC] Update cycle:")
+	# print("  Camera XZ: (%.1f, %.1f) - %s" % [camera_pos.x, camera_pos.z, "MOVING" if camera_moved else "STABLE (%d cycles)" % diagnostic_camera_stable_count])
+	# print("  Desired LOD 0 chunks: %d" % desired_lod0_count)
+	# print("  Loaded LOD 0 chunks: %d" % loaded_lod0_count)
+	# print("  Loaded: %d total (LOD0=%d, LOD1=%d, LOD2=%d, LOD3=%d, LOD4=%d)" %
+	# 	[loaded_chunks.size(), lod_counts[0], lod_counts[1], lod_counts[2], lod_counts[3], lod_counts[4]])
 	
 	var to_load: Array = []
 	var to_unload_candidates: Array = []
