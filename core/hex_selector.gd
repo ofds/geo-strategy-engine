@@ -6,7 +6,7 @@ extends Node3D
 const SQRT3 := 1.73205080757
 const LIFT_TOP_M := 150.0
 const LIFT_DURATION_S := 0.3
-const WALL_DEPTH_M := 40.0
+const WALL_DEPTH_M := 120.0  # 3x deeper for dramatic "chunk of earth" feel
 const OSCILLATION_AMP_M := 3.0
 const OSCILLATION_HZ := 1.0
 # Rectangular grid clipped to hex: step 50m, hex radius R = hex_size/sqrt(3)
@@ -181,7 +181,6 @@ func _build_slice_mesh() -> ArrayMesh:
 	min_terrain_y = boundary_result[1]
 	if min_terrain_y > 99998.0:
 		min_terrain_y = 0.0
-	var wall_bottom_y: float = min_terrain_y - WALL_DEPTH_M
 
 	# --- Rectangular grid (snap outer points to hex boundary) ---
 	var step: float = GRID_STEP_M
@@ -264,11 +263,13 @@ func _build_slice_mesh() -> ArrayMesh:
 	# --- Smooth normals for top surface ---
 	_compute_grid_normals(vertices, normals, indices, vertices.size())
 
-	# --- Side walls: consecutive boundary vertices, quad each (top L/R, bottom L/R); close loop with % size ---
+	# --- Side walls: consecutive boundary vertices, quad each (top L/R, bottom L/R). Bottom follows terrain (each vertex drops WALL_DEPTH_M from its surface height). ---
 	for k in range(boundary_verts.size()):
 		var next_k: int = (k + 1) % boundary_verts.size()
 		var pt: Vector3 = boundary_verts[k]
 		var pn: Vector3 = boundary_verts[next_k]
+		var pt_bottom_y: float = pt.y - WALL_DEPTH_M
+		var pn_bottom_y: float = pn.y - WALL_DEPTH_M
 		var outwards: Vector3 = Vector3(pt.x, 0.0, pt.z)
 		if outwards.length_squared() > 1e-6:
 			outwards = outwards.normalized()
@@ -283,13 +284,13 @@ func _build_slice_mesh() -> ArrayMesh:
 		vertices.append(Vector3(pt.x, pt.y + SLICE_TERRAIN_OFFSET_M, pt.z))
 		colors.append(earth)
 		normals.append(outwards)
-		vertices.append(Vector3(pt.x, wall_bottom_y, pt.z))
+		vertices.append(Vector3(pt.x, pt_bottom_y, pt.z))
 		colors.append(earth)
 		normals.append(outwards)
 		vertices.append(Vector3(pn.x, pn.y + SLICE_TERRAIN_OFFSET_M, pn.z))
 		colors.append(earth)
 		normals.append(out_n)
-		vertices.append(Vector3(pn.x, wall_bottom_y, pn.z))
+		vertices.append(Vector3(pn.x, pn_bottom_y, pn.z))
 		colors.append(earth)
 		normals.append(out_n)
 		# Quad: top-left, bottom-left, bottom-right, top-right. CCW from outside (normal points out): two tris
@@ -328,36 +329,37 @@ func _compute_grid_normals(vertices: PackedVector3Array, normals: PackedVector3A
 			normals[idx] = accum[idx].normalized()
 
 
-func _build_golden_rim_mesh() -> ArrayMesh:
-	var hex_size: float = Constants.HEX_SIZE_M
-	var corners: PackedVector2Array = _hex_corners_local(hex_size)
-	var vertices := PackedVector3Array()
-	for e in range(6):
-		var a: Vector2 = corners[e]
-		var wx0: float = _center_x + a.x
-		var wz0: float = _center_z + a.y
-		var h: float = _chunk_manager.get_height_at(wx0, wz0) if _chunk_manager else 0.0
-		if h < 0.0:
-			h = 0.0
-		vertices.append(Vector3(a.x, h + SLICE_TERRAIN_OFFSET_M, a.y))
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.9, 0.75, 0.3)
-	mat.emission_enabled = true
-	mat.emission = Color(0.9, 0.75, 0.3)
-	mat.emission_energy_multiplier = 0.8
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	var mesh := ArrayMesh.new()
-	var indices := PackedInt32Array()
-	for i in range(6):
-		indices.append(i)
-	indices.append(0)
-	var arr: Array = []
-	arr.resize(Mesh.ARRAY_MAX)
-	arr[Mesh.ARRAY_VERTEX] = vertices
-	arr[Mesh.ARRAY_INDEX] = indices
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINE_STRIP, arr)
-	mesh.surface_set_material(0, mat)
-	return mesh
+# Rim is now drawn in screen-space shader (hex_overlay_screen.glsl) — thick, visible, scales with altitude.
+# func _build_golden_rim_mesh() -> ArrayMesh:
+# 	var hex_size: float = Constants.HEX_SIZE_M
+# 	var corners: PackedVector2Array = _hex_corners_local(hex_size)
+# 	var vertices := PackedVector3Array()
+# 	for e in range(6):
+# 		var a: Vector2 = corners[e]
+# 		var wx0: float = _center_x + a.x
+# 		var wz0: float = _center_z + a.y
+# 		var h: float = _chunk_manager.get_height_at(wx0, wz0) if _chunk_manager else 0.0
+# 		if h < 0.0:
+# 			h = 0.0
+# 		vertices.append(Vector3(a.x, h + SLICE_TERRAIN_OFFSET_M, a.y))
+# 	var mat := StandardMaterial3D.new()
+# 	mat.albedo_color = Color(0.9, 0.75, 0.3)
+# 	mat.emission_enabled = true
+# 	mat.emission = Color(0.9, 0.75, 0.3)
+# 	mat.emission_energy_multiplier = 0.8
+# 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+# 	var mesh := ArrayMesh.new()
+# 	var indices := PackedInt32Array()
+# 	for i in range(6):
+# 		indices.append(i)
+# 	indices.append(0)
+# 	var arr: Array = []
+# 	arr.resize(Mesh.ARRAY_MAX)
+# 	arr[Mesh.ARRAY_VERTEX] = vertices
+# 	arr[Mesh.ARRAY_INDEX] = indices
+# 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINE_STRIP, arr)
+# 	mesh.surface_set_material(0, mat)
+# 	return mesh
 
 
 func set_selected_hex(center_xz: Vector2) -> void:
@@ -381,16 +383,36 @@ func set_selected_hex(center_xz: Vector2) -> void:
 	_slice_instance.mesh = _slice_mesh
 	_slice_instance.position = Vector3(_center_x, 0.0, _center_z)
 	var mat := StandardMaterial3D.new()
-	mat.vertex_colors_used = true
+	# Godot 4: use vertex COLOR as albedo so slice top shows terrain colors, walls show earth
+	mat.vertex_color_use_as_albedo = true
+	mat.albedo_color = Color.WHITE
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
 	_slice_instance.material_override = mat
 	add_child(_slice_instance)
 
-	var rim_mesh: ArrayMesh = _build_golden_rim_mesh()
-	if rim_mesh.get_surface_count() > 0:
-		var rim_instance := MeshInstance3D.new()
-		rim_instance.mesh = rim_mesh
-		_slice_instance.add_child(rim_instance)
+	# Rim is now drawn in screen-space shader (hex_overlay_screen.glsl)
+	# var rim_mesh: ArrayMesh = _build_golden_rim_mesh()
+	# if rim_mesh.get_surface_count() > 0:
+	# 	var rim_instance := MeshInstance3D.new()
+	# 	rim_instance.mesh = rim_mesh
+	# 	_slice_instance.add_child(rim_instance)
+
+	# --- DIAGNOSTIC (remove after debugging) ---
+	var hex_center := Vector2(_center_x, _center_z)
+	var vert_count := 0
+	if _slice_mesh and _slice_mesh.get_surface_count() > 0:
+		var arrs = _slice_mesh.surface_get_arrays(0)
+		var verts = arrs[Mesh.ARRAY_VERTEX] if arrs.size() > Mesh.ARRAY_VERTEX else null
+		vert_count = verts.size() if verts else 0
+	print("=== SLICE DIAGNOSTIC ===")
+	print("Hex center: ", hex_center)
+	print("Vertices generated: ", vert_count)
+	print("Slice node exists: ", _slice_instance != null)
+	if _slice_instance:
+		print("  Visible: ", _slice_instance.visible)
+		print("  Position: ", _slice_instance.position)
+		print("  Children: ", _slice_instance.get_child_count())
+	print("========================")
 
 
 func clear_selection() -> void:

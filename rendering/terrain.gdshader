@@ -19,6 +19,14 @@ uniform vec2 overview_origin = vec2(0.0, 0.0);
 uniform vec2 overview_size = vec2(1.0, 1.0);
 uniform bool use_overview = false;
 
+// Hex grid: same lens as selection (basic_camera.gd). hex_size = pointy-top radius = HEX_SIZE_M/sqrt(3).
+uniform float hex_size = 577.35;
+uniform float hex_line_width = 22.0;
+uniform float hex_line_softness = 5.0;
+uniform float hex_grid_strength = 0.55;
+uniform vec3 hex_line_color = vec3(0.10, 0.12, 0.08);
+uniform bool show_hex_grid = true;
+
 varying vec3 v_world_pos;
 varying vec3 v_view_dir;
 varying float v_elevation;
@@ -62,6 +70,50 @@ vec3 terrain_low_elev_color(float elev) {
 	vec3 c = mix(COLOR_COASTAL_LOW, COLOR_PLAINS, t50);
 	c = mix(c, COLOR_LOW_HILLS, t150);
 	return c;
+}
+
+// --- Same lens as selection: formulas match basic_camera.gd (world_to_axial, axial_to_world, hex shape). ---
+vec2 world_to_axial(vec2 xz, float size) {
+	return vec2((2.0/3.0 * xz.x) / size, (-1.0/3.0 * xz.x + sqrt(3.0)/3.0 * xz.y) / size);
+}
+vec2 axial_to_center(vec2 axial, float size) {
+	return vec2(size * (1.5 * axial.x), size * (sqrt(3.0)/2.0 * axial.x + sqrt(3.0) * axial.y));
+}
+vec3 cube_round(vec3 c) {
+	vec3 r = round(c);
+	vec3 d = abs(r - c);
+	if (d.x > d.y && d.x > d.z) r.x = -r.y - r.z;
+	else if (d.y > d.z) r.y = -r.x - r.z;
+	else r.z = -r.x - r.y;
+	return r;
+}
+float seg_dist(vec2 p, vec2 a, vec2 b) {
+	vec2 pa = p - a, ba = b - a;
+	float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+	return length(pa - ba * h);
+}
+// Inward side of edge a->b; inside hex when all six >= 0.
+float edge_side(vec2 p, vec2 a, vec2 b) {
+	vec2 e = b - a;
+	return (p.x - a.x) * e.y - (p.y - a.y) * e.x;
+}
+// Same cell as selection. Returns (distance to edge, 1 if inside cell else 0). One pass, no gap triangles.
+vec2 hex_edge_and_inside(vec2 world_xz, float size) {
+	vec2 axial = world_to_axial(world_xz, size);
+	vec3 r = cube_round(vec3(axial.x, -axial.x - axial.y, axial.y));
+	vec2 center = axial_to_center(vec2(r.x, r.z), size);
+	vec2 p = world_xz - center;
+	float k = size;
+	float c = 0.866025, s = 0.5;
+	vec2 v0 = k * vec2(0.0, 1.0), v1 = k * vec2(c, s), v2 = k * vec2(c, -s);
+	vec2 v3 = k * vec2(0.0, -1.0), v4 = k * vec2(-c, -s), v5 = k * vec2(-c, s);
+	float d0 = seg_dist(p, v0, v1), d1 = seg_dist(p, v1, v2), d2 = seg_dist(p, v2, v3);
+	float d3 = seg_dist(p, v3, v4), d4 = seg_dist(p, v4, v5), d5 = seg_dist(p, v5, v0);
+	float edge_d = min(min(min(d0, d1), min(d2, d3)), min(d4, d5));
+	float in0 = edge_side(p, v0, v1), in1 = edge_side(p, v1, v2), in2 = edge_side(p, v2, v3);
+	float in3 = edge_side(p, v3, v4), in4 = edge_side(p, v4, v5), in5 = edge_side(p, v5, v0);
+	float inside = (in0 >= 0.0 && in1 >= 0.0 && in2 >= 0.0 && in3 >= 0.0 && in4 >= 0.0 && in5 >= 0.0) ? 1.0 : 0.0;
+	return vec2(edge_d, inside);
 }
 
 void vertex() {
@@ -118,9 +170,22 @@ void fragment() {
 	float fog_factor = smoothstep(fog_start, fog_end_actual, dist);
 	base_col = mix(base_col, fog_color, fog_factor);
 
+	// Hex grid: same cells as selection; draw band at edges, only inside cell (no gap triangles)
+	float hex_line_mask = 0.0;
+	if (show_hex_grid) {
+		vec2 edge_inside = hex_edge_and_inside(v_world_pos.xz, hex_size);
+		float d = edge_inside.x;
+		float inside = edge_inside.y;
+		float aa = fwidth(d) * hex_line_softness;
+		hex_line_mask = (1.0 - smoothstep(hex_line_width - aa, hex_line_width + aa, d)) * inside;
+		hex_line_mask *= smoothstep(0.35, 0.65, dot(n, vec3(0.0, 1.0, 0.0)));
+		base_col = mix(base_col, base_col * 0.55, hex_line_mask * hex_grid_strength);
+		base_col = mix(base_col, hex_line_color, hex_line_mask * hex_grid_strength * 0.7);
+	}
+
 	ALBEDO = min(base_col, vec3(1.5));
 	EMISSION = vec3(0.0);
-	ROUGHNESS = roughness;
+	ROUGHNESS = clamp(roughness + hex_line_mask * hex_grid_strength * 0.3, 0.0, 1.0);
 	METALLIC = metallic;
 	RIM = rim;
 	RIM_TINT = rim_tint;

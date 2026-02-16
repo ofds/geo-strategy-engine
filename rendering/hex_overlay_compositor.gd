@@ -12,6 +12,16 @@ var camera_position: Vector3 = Vector3.ZERO
 var hovered_hex_center: Vector2 = Vector2(-999999.0, -999999.0)
 var selected_hex_center: Vector2 = Vector2(-999999.0, -999999.0)
 var selection_time: float = 0.0
+## 0=off, 1=raw depth (bright=near), 2=world XZ pattern. Use to debug grid drift.
+@export var debug_visualization: float = 0.0
+## If true, show depth gradient (red=near, blue=far) and skip grid. Use to verify depth texture.
+@export var debug_depth: bool = false
+## If depth is "all dark", try true to use (1 - depth) as NDC z.
+@export var depth_ndc_flip: bool = false
+## If true, use resolved depth texture instead of raw. Try this if debug depth shows solid blue (raw = 0).
+@export var use_resolved_depth: bool = false
+## If true, compositor draws grid lines; false = grid in terrain shader only (selection/hover here).
+@export var draw_grid_lines: bool = false
 
 # --- Internal ---
 var _rd: RenderingDevice
@@ -21,6 +31,7 @@ var _params_buffer: RID
 var _depth_sampler: RID  # For SAMPLER_WITH_TEXTURE (depth texture)
 const _PARAMS_SIZE: int = 256  # 64+64+rest, 16-byte aligned
 var _params_bytes: PackedByteArray
+var _matrices_verified: bool = false
 
 func _init() -> void:
 	effect_callback_type = EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT
@@ -100,50 +111,56 @@ func _render_callback(p_effect_callback_type: int, p_render_data: RenderData) ->
 	var size: Vector2i = buffers_rd.get_internal_size()
 	if size.x <= 0 or size.y <= 0:
 		return
-	# Camera matrices (view-to-world and inv projection for depth unprojection)
+	# Two-step unproject: clip -> view (inv_projection) then view -> world (inv_view = cam transform)
 	var scene_data: RenderSceneData = p_render_data.get_render_scene_data()
 	if not scene_data:
 		return
-	var cam_proj: Projection = scene_data.get_cam_projection()
+	var view_proj: Projection = scene_data.get_view_projection(0)
 	var cam_transform: Transform3D = scene_data.get_cam_transform()
-	var inv_proj: Projection = cam_proj.inverse()
-	# Pack Params: column-major inv_projection (64), column-major inv_view / camera transform (64), then scalars
+	var o := cam_transform.origin
+	# P = view_proj * V^-1; V = inverse(cam), so P = view_proj * Projection(cam_transform)
+	var proj_cam: Projection = Projection(cam_transform)
+	var proj_only: Projection = view_proj * proj_cam
+	var inv_proj: Projection = proj_only.inverse()
+	# inv_view = camera to world = cam_transform (4x4)
+	var basis := cam_transform.basis
+	var origin := cam_transform.origin
+
+	# One-time matrix verification
+	if not _matrices_verified:
+		print("HexOverlayCompositor inv_proj diagonal: ", inv_proj.x.x, ", ", inv_proj.y.y, ", ", inv_proj.z.z, ", ", inv_proj.w.w)
+		print("HexOverlayCompositor inv_view (cam) origin: ", origin.x, ", ", origin.y, ", ", origin.z)
+		_matrices_verified = true
+
+	# Pack Params: inv_projection (64) + inv_view as 4 columns (64), then scalars at 128
 	var ofs := 0
-	# inv_projection (Godot Projection: x,y,z,w are columns) — pack col0, col1, col2, col3
 	for col in [inv_proj.x, inv_proj.y, inv_proj.z, inv_proj.w]:
 		_params_bytes.encode_float(ofs, col.x); _params_bytes.encode_float(ofs + 4, col.y); _params_bytes.encode_float(ofs + 8, col.z); _params_bytes.encode_float(ofs + 12, col.w)
 		ofs += 16
-	# inv_view = camera transform (view-to-world). Column-major: basis.x, basis.y, basis.z, origin
-	var b := cam_transform.basis
-	var o := cam_transform.origin
-	_params_bytes.encode_float(ofs, b.x.x); _params_bytes.encode_float(ofs + 4, b.x.y); _params_bytes.encode_float(ofs + 8, b.x.z); _params_bytes.encode_float(ofs + 12, 0.0)
-	ofs += 16
-	_params_bytes.encode_float(ofs, b.y.x); _params_bytes.encode_float(ofs + 4, b.y.y); _params_bytes.encode_float(ofs + 8, b.y.z); _params_bytes.encode_float(ofs + 12, 0.0)
-	ofs += 16
-	_params_bytes.encode_float(ofs, b.z.x); _params_bytes.encode_float(ofs + 4, b.z.y); _params_bytes.encode_float(ofs + 8, b.z.z); _params_bytes.encode_float(ofs + 12, 0.0)
-	ofs += 16
-	_params_bytes.encode_float(ofs, o.x); _params_bytes.encode_float(ofs + 4, o.y); _params_bytes.encode_float(ofs + 8, o.z); _params_bytes.encode_float(ofs + 12, 1.0)
-	ofs += 16
+	# inv_view from Transform3D: columns 0,1,2 = basis (w=0), column 3 = origin (w=1)
+	_params_bytes.encode_float(ofs, basis.x.x); _params_bytes.encode_float(ofs + 4, basis.x.y); _params_bytes.encode_float(ofs + 8, basis.x.z); _params_bytes.encode_float(ofs + 12, 0.0); ofs += 16
+	_params_bytes.encode_float(ofs, basis.y.x); _params_bytes.encode_float(ofs + 4, basis.y.y); _params_bytes.encode_float(ofs + 8, basis.y.z); _params_bytes.encode_float(ofs + 12, 0.0); ofs += 16
+	_params_bytes.encode_float(ofs, basis.z.x); _params_bytes.encode_float(ofs + 4, basis.z.y); _params_bytes.encode_float(ofs + 8, basis.z.z); _params_bytes.encode_float(ofs + 12, 0.0); ofs += 16
+	_params_bytes.encode_float(ofs, origin.x); _params_bytes.encode_float(ofs + 4, origin.y); _params_bytes.encode_float(ofs + 8, origin.z); _params_bytes.encode_float(ofs + 12, 1.0); ofs += 16
 	# hex_size, show_grid (1.0=true), altitude, _pad0
 	_params_bytes.encode_float(ofs, hex_size); ofs += 4
 	_params_bytes.encode_float(ofs, 1.0 if show_grid else 0.0); ofs += 4
 	_params_bytes.encode_float(ofs, altitude); ofs += 4
-	_params_bytes.encode_float(ofs, 0.0); ofs += 4
-	# camera_position (vec3), time (float)
-	_params_bytes.encode_float(ofs, camera_position.x); _params_bytes.encode_float(ofs + 4, camera_position.y); _params_bytes.encode_float(ofs + 8, camera_position.z); ofs += 12
+	_params_bytes.encode_float(ofs, 1.0 if depth_ndc_flip else 0.0); ofs += 4
+	# camera_position (vec3): use render camera origin for camera-relative hex math
+	_params_bytes.encode_float(ofs, o.x); _params_bytes.encode_float(ofs + 4, o.y); _params_bytes.encode_float(ofs + 8, o.z); ofs += 12
 	_params_bytes.encode_float(ofs, Time.get_ticks_msec() / 1000.0); ofs += 4
 	# hovered_hex_center, selected_hex_center
 	_params_bytes.encode_float(ofs, hovered_hex_center.x); _params_bytes.encode_float(ofs + 4, hovered_hex_center.y); ofs += 8
 	_params_bytes.encode_float(ofs, selected_hex_center.x); _params_bytes.encode_float(ofs + 4, selected_hex_center.y); ofs += 8
 	_params_bytes.encode_float(ofs, selection_time); ofs += 4
-	_params_bytes.encode_float(ofs, 0.0); ofs += 4
+	_params_bytes.encode_float(ofs, debug_visualization); ofs += 4
+	_params_bytes.encode_float(ofs, 1.0 if debug_depth else 0.0); ofs += 4
+	_params_bytes.encode_float(ofs, 1.0 if use_resolved_depth else 0.0); ofs += 4
+	_params_bytes.encode_float(ofs, 1.0 if draw_grid_lines else 0.0); ofs += 4
 	_rd.buffer_update(_params_buffer, 0, _PARAMS_SIZE, _params_bytes)
-	# Depth texture (resolved if MSAA)
-	var depth_tex: RID = buffers_rd.get_depth_texture(false)
-	if access_resolved_depth and buffers_rd.get_msaa_3d() != RenderingServer.VIEWPORT_MSAA_DISABLED:
-		# When access_resolved_depth is true, use get_texture for resolved depth if API provides it
-		if buffers_rd.has_texture(&"render_buffers", &"depth"):
-			depth_tex = buffers_rd.get_texture(&"render_buffers", &"depth")
+	# Depth texture: raw (false) or resolved (true). If debug depth is solid blue, try use_resolved_depth = true.
+	var depth_tex: RID = buffers_rd.get_depth_texture(use_resolved_depth)
 	if not depth_tex.is_valid():
 		return
 	var view_count := buffers_rd.get_view_count()
@@ -151,9 +168,10 @@ func _render_callback(p_effect_callback_type: int, p_render_data: RenderData) ->
 		var color_image: RID = buffers_rd.get_color_layer(view)
 		if not color_image.is_valid():
 			continue
-		var depth_for_view: RID = depth_tex
-		if view_count > 1 and buffers_rd.has_texture(&"render_buffers", &"depth"):
-			depth_for_view = buffers_rd.get_depth_layer(view, false)
+		# Use this view's depth layer so we read the buffer that was actually written for this view
+		var depth_for_view: RID = buffers_rd.get_depth_layer(view, use_resolved_depth) if view_count > 0 else depth_tex
+		if not depth_for_view.is_valid():
+			depth_for_view = depth_tex
 		var u0 := RDUniform.new()
 		u0.uniform_type = RenderingDevice.UNIFORM_TYPE_IMAGE
 		u0.binding = 0
