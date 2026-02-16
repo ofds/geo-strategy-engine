@@ -1,182 +1,500 @@
-# GeoStrategy Engine — Codebase Audit Report
+# GeoStrategy Engine — Codebase Audit
 
-**Date:** February 15, 2026  
+## Date: February 16, 2026
+
 **Scope:** Read-only audit. No code was modified.  
-**Purpose:** Complete picture of current state before further fixes.
+**Purpose:** Explore, document, and report for architect decisions. Hex grid and selection pipeline documented in detail.
 
 ---
 
-## Section 1: File Inventory
+## 1. File Inventory
 
-For every file in the project (code, shaders, scenes, resources, data):
+Excludes: `.godot/`, `.import/`, binary assets (PNG, .hgt, etc.). Data chunk PNGs and tools/cache omitted.
 
-| File | Lines | Purpose (1 sentence) | Status | Notes |
-|------|-------|------------------------|--------|-------|
-| `core/chunk_manager.gd` | 1318 | Drives terrain streaming: desired set, async load queue, Phase B micro-steps, visibility, deferred unload. | Working | Central orchestrator; DEBUG_STREAMING_TIMING, DEBUG_DIAGNOSTIC. |
-| `core/terrain_loader.gd` | 957 | Stateless chunk loading: 16-bit PNG decode, LOD mesh/collision, shared terrain material + hex next_pass, height cache. | Working | Phase A/B split; DEBUG_CHUNK_TIMING, DEBUG_HEX_GRID. |
-| `core/terrain_worker.gd` | 291 | Static Phase A worker: PNG decode + mesh arrays on WorkerThreadPool; no node refs. | Working | Used via Callable(TerrainWorker, "compute_chunk_data").bind(args). |
-| `core/hex_selector.gd` | 396 | Physical hex slice: build mesh from height cache, walls/rim, lift + oscillation, cutout alignment. | Fragile | Depends on get_height_at; >20% cache miss → warning; rim is LINE_STRIP. |
-| `rendering/terrain.gdshader` | 127 | Terrain only: elevation/slope color, water, overview blend, fog, desaturation, edge fade. | Working | depth_draw_opaque; no hex logic. |
-| `rendering/hex_grid.gdshader` | 176 | Hex overlay (next_pass): grid lines, hover, selection cutout/border/glow/darken; depth_test_disabled. | Working | blend_mix; alpha only where grid/hover/selection. |
-| `rendering/basic_camera.gd` | 612 | Orbital camera: WASD, zoom, orbit, terrain clearance, hex hover/selection, terrain/hex material uniforms. | Working | DEBUG_DIAGNOSTIC; updates shared material from first chunk in group. |
-| `config/constants.gd` | 174 | Central constants: LOD, hex, paths, camera, grid fade, etc. | Working | Single source of truth; some values duplicated in chunk_manager (LOD distances). |
-| `scenes/terrain_demo.tscn` | 99 | Main scene: TerrainLoader, ChunkManager, HexSelector, Camera3D, LoadingScreen, FPS, ProfilingDriver, DiagnosticDriver. | Working | Entry point; DEBUG flags set in scene (e.g. Camera DEBUG_DIAGNOSTIC true). |
-| `node_3d.tscn` | 37 | Minimal scene: TerrainLoader, ChunkManager, Camera3D, light, env; no LoadingScreen/HexSelector. | Unknown | Alternate/minimal run; may miss refs. |
-| `ui/loading_screen.gd` | 44 | Shows progress bar during initial chunk load; hide_loading when initial load complete. | Working | Progress bar max_value = total from ChunkManager. |
-| `ui/fps_counter.gd` | 43 | Label: FPS, rolling avg, 1% low, draw calls; [PERF] if 1% low < 60. | Working | Reads ChunkManager._last_phase_b_ms for warning. |
-| `data/terrain/terrain_metadata.json` | ~91583 | Region metadata: bounding_box, resolution_m, max_elevation_m, chunk list, overview_texture. | Working | Very large (chunks array); used by TerrainLoader, ChunkManager, camera. |
-| `config/regions.json` | ~25 | Region definitions (alps_test, europe) for process_terrain.py. | Working | Not loaded by engine at runtime. |
-| `tools/process_terrain.py` | 509 | Python CLI: download SRTM, merge, LOD/chunk, overview texture, terrain_metadata.json. | Working | Requires numpy, Pillow; cache in tools/cache. |
-| `tools/diagnostic_camera_driver.gd` | 298 | Automated camera sequence: zoom out/in, pan, orbit, region jump; logs [DIAG] and phase summaries. | Working | @export enabled = false; uses get_diagnostic_snapshot(). |
-| `tools/profiling_camera_driver.gd` | 117 | Stress-test: pan, zoom in/out, fast pan; then quit. For [TIME] / streaming analysis. | Working | @export enabled = false; uses initial_load_complete. |
-| `rendering/overview.gdshader` | 46 | Standalone overview plane shader (fog, desat, edge fade). | Dead code | PROGRESS.md says "Removed"; file still present; ChunkManager uses StandardMaterial3D for overview plane. |
-| `rendering/hex_overlay.gdshader` | 154 | Older hex overlay (v_is_selected varying, different uniforms). | Dead code | PROGRESS.md says "Removed"; replaced by hex_grid.gdshader as next_pass. |
-| `docs/PROGRESS.md` | 259 | Progress tracker, session notes, backlog, architecture vision. | Working | Documentation only. |
-| `.vscode/settings.json` | — | Editor settings. | — | Not part of engine logic. |
+| Path | Type | Lines | Purpose (one line) |
+|------|------|-------|--------------------|
+| `project.godot` | Config | 17 | Godot 4.5 project config; main scene = terrain_demo. |
+| `.gitignore` | Config | 10 | Ignores .godot/, data/, tools/, profiling output. |
+| `.gitattributes` | Config | — | Git line endings / attributes. |
+| `config/constants.gd` | GDScript | 175 | Central constants: LOD, hex (HEX_SIZE_M, grid fade), camera, paths, debug. |
+| `config/regions.json` | JSON | 20 | Region definitions (alps_test, europe) for process_terrain.py; not loaded at runtime. |
+| `core/chunk_manager.gd` | GDScript | 1328 | Terrain streaming: desired set, async Phase A/B, visibility, deferred unload, get_height_at / get_lod_at_world_position. |
+| `core/terrain_loader.gd` | GDScript | 951 | Stateless chunk loading: 16-bit PNG, LOD mesh/collision, shared terrain material (no next_pass), height cache, get_height_at. |
+| `core/terrain_worker.gd` | GDScript | 295 | Static Phase A worker: PNG decode + mesh arrays on WorkerThreadPool; no node refs. |
+| `core/hex_selector.gd` | GDScript | 406 | Physical hex slice: mesh from height cache, walls, lift + oscillation; rim drawn in compositor. |
+| `rendering/terrain.gdshader` | Shader | 187 | Terrain: elevation/slope color, water, overview blend, fog, edge fade; **hex grid lines** (world-space, pointy-top). |
+| `rendering/hex_overlay_screen.glsl` | GLSL (compute) | 237 | Screen-space compositor: depth unproject, world XZ, grid (optional), hover, selection rim/cutout/darken. |
+| `rendering/hex_overlay_compositor.gd` | GDScript | 196 | CompositorEffect: loads GLSL, packs Params (inv_proj, inv_view, hex_size, hover/selection), dispatches compute. |
+| `rendering/hex_grid_OLD.gdshader` | Shader | 194 | Archived next_pass hex overlay (depth_test_disabled); replaced by terrain in-shader grid + compositor. |
+| `rendering/basic_camera.gd` | GDScript | 698 | Orbital camera: WASD, zoom, orbit, terrain clearance; hex hover/selection raycast; terrain + compositor uniforms; F1–F6 hex debug. |
+| `scenes/terrain_demo.tscn` | Scene | 99 | Main scene: TerrainLoader, ChunkManager, HexSelector, Camera3D, WorldEnvironment, LoadingScreen, FPS, ProfilingDriver, DiagnosticDriver. |
+| `node_3d.tscn` | Scene | 37 | Minimal: TerrainLoader, ChunkManager, Camera3D, light, env; no LoadingScreen/HexSelector. |
+| `ui/loading_screen.gd` | GDScript | 44 | Progress bar during initial chunk load; update_progress(current, total, chunk_name). |
+| `ui/fps_counter.gd` | GDScript | 43 | Label: FPS, rolling avg, 1% low, draw calls; [PERF] if 1% low < 60. |
+| `tools/process_terrain.py` | Python | 509 | CLI: download SRTM, merge, LOD/chunk, overview texture, terrain_metadata.json. |
+| `tools/diagnostic_camera_driver.gd` | GDScript | 298 | Automated camera sequence; logs [DIAG]; get_diagnostic_snapshot(). |
+| `tools/profiling_camera_driver.gd` | GDScript | 117 | Stress-test pan/zoom then quit; initial_load_complete. |
+| `tools/visualize_heightmap.py` | Python | 29 | Visualize heightmap (small util). |
+| `tools/generate_test_data.py` | Python | 125 | Generate test terrain data. |
+| `tools/validate_output.py` | Python | 396 | Validate pipeline output. |
+| `tools/validate_16bit.py` | Python | 80 | Validate 16-bit PNG. |
+| `tools/README.md` | Docs | 138 | Tools usage. |
+| `data/terrain/terrain_metadata.json` | JSON | ~91583 | Region metadata: bounding_box, resolution_m, chunks list, overview_texture path. |
+| `docs/PROGRESS.md` | Docs | 229 | Progress tracker, backlog, architecture notes. |
+| `docs/HEX_OVERLAY_FINAL_SUMMARY.md` | Docs | 81 | Compositor hex overlay summary. |
+| `docs/HEX_GRID_DECAL_FINDINGS.md` | Docs | 78 | Decal/grid findings. |
+| `docs/HEX_SELECTION_DIAGNOSTIC_REPORT.md` | Docs | 237 | Selection diagnostic. |
+| `docs/GeoStrategy_Engine_SSOT.md` | Docs | 669 | Single source of truth / design. |
+| `.vscode/settings.json` | Config | 3 | Editor settings. |
 
-**Summary:** 2 dead shader files (overview.gdshader, hex_overlay.gdshader) still on disk; 1 minimal scene (node_3d.tscn) with unknown usage; rest are in use and either Working or Fragile.
-
----
-
-## Section 2: System Architecture (Actual, Not Planned)
-
-### 2.1 Terrain Streaming Pipeline
-
-- **Desired set:** `_determine_desired_chunks(camera_pos)` in chunk_manager.gd. Inner ring: LOD 0 cells within `INNER_RADIUS_M` (500 km), per-cell LOD from `_select_lod_with_hysteresis` using `LOD_DISTANCES_M` and altitude (above 70 km → no LOD 0). Outer ring: LOD 4 only from 500 km to `visible_radius` (max(500 km, altitude × 2.5)). Then `_expand_lod0_to_full_blocks(desired)` adds sibling chunks so every LOD 0–3 chunk is in a complete 2×2 block (so coarse parent can be hidden when all 4 children are loaded).
-- **Loading:** Phase A: `terrain_loader.start_async_load(x, y, lod)` submits `TerrainWorker.compute_chunk_data` to WorkerThreadPool; result (vertices, normals, indices, height_data, etc.) stored in args["result"]. Phase B on main thread: `_drain_completed_async_to_phase_b()` moves completed tasks into `_pending_phase_b`. Each entry has step 0=MESH, 1=SCENE, 2=COLLISION. `_do_one_phase_b_step()` does one step per call: step 0 → `finish_load_step_mesh`, step 1 → `finish_load_step_scene` (create MeshInstance3D, add to chunks_container, scale tween 0.97→1), step 2 → `finish_load_step_collision` then pop and register in `loaded_chunks`. Up to 4 (or 8 if queue > 20) async loads in flight; one new load submitted per frame in `_process` when queue has work. Phase B runs with 8 ms frame budget (16 ms during initial load), minimum 1 step per frame when pending (3 when alt < 15 km and backlog > 2).
-- **Unloading:** Chunks in `loaded_chunks` but not in `desired` become unload candidates. Deferred unload: a chunk is unloaded only if (a) its LOD 0 cells are all covered by finer *loaded* chunks, or (b) deferred timeout (5 s normal, 1 s after large move >200 km). Immediate unload when camera jumped and chunk is beyond 1.5× visible radius. Burst unloads (>10) are spread across frames via `_pending_unload_keys`.
-- **LOD decisions:** Per LOD 0 cell: distance-based LOD from `LOD_DISTANCES_M` (0–50 km LOD 0, 50–75 km LOD 1, …), with hysteresis (downgrade only after 10% buffer). Altitude gate: above 70 km, base_lod 0 is forced to 1.
-- **Chunk visibility:** `_update_chunk_visibility()` runs after each `_update_chunks()`. For each loaded chunk: LOD 0 always visible; LOD > 0 hidden iff all four finer children (at LOD-1, 2×2 sub-chunks) exist in `loaded_chunks`. So multiple LODs can be in `loaded_chunks` but only the finest covering each area is shown.
-- **Uniforms flow:** Camera does not push uniforms to ChunkManager or TerrainLoader. Camera in `_update_hex_grid_interaction()` gets terrain material via `get_first_node_in_group("terrain_chunks")` → get_surface_override_material(0), and hex material as terrain_material.next_pass. Camera sets on terrain: altitude, camera_position, terrain_center_xz, terrain_radius_m. On hex: altitude, selection_time, selected_hex_center; hovered_hex_center set from raycast. TerrainLoader sets terrain material defaults and overview_texture/origin/size in _ready; ChunkManager only creates overview plane and chunk nodes that use the shared material.
-
-### 2.2 Terrain Rendering
-
-- **Terrain shader (terrain.gdshader):** Vertex: world position, elevation (VERTEX.y), world normal. Fragment: if elevation < 5 m → water color (blue gradient by camera distance); else height-based terrain color (terrain_height_color + terrain_low_elev_color for <300 m), then steep slope mix with COLOR_STEEP_ROCK (n.y < 0.5). Overview: if use_overview, sample overview_texture at (world_xz - overview_origin) / overview_size, blend with mesh color by altitude (smoothstep 15–180 km). Then desaturation by altitude, edge fade (dist to terrain_center_xz vs terrain_radius_m), distance fog (fog_start/fog_end_actual, fog_color). Outputs ALBEDO, ROUGHNESS, METALLIC, RIM, RIM_TINT; EMISSION = 0.
-- **Render mode:** blend_mix, depth_draw_opaque, cull_back. So terrain writes depth and is opaque.
-- **Uniforms set by:** TerrainLoader _ready (albedo, roughness, overview_texture, overview_origin, overview_size, use_overview). Camera every frame (altitude, camera_position, terrain_center_xz, terrain_radius_m).
-- **Overview texture:** Loaded in TerrainLoader from metadata overview_texture path; dimensions from grid × 512 × resolution_m. Same extent as chunk grid so UV aligns.
-- **Overview plane (safety net):** ChunkManager `_setup_overview_plane()`: if metadata has overview_texture, creates a quad mesh (0,0,0) to (overview_w, 0, overview_h), Y = -20, StandardMaterial3D unshaded with albedo_texture = same overview image. Fills gaps where no chunk exists at high zoom.
-
-### 2.3 Hex Grid Overlay
-
-- **Setup:** TerrainLoader creates shared_terrain_material (terrain.gdshader), then creates hex_material (hex_grid.gdshader), sets hex_material as shader_material.next_pass. So every chunk using shared_terrain_material draws terrain then the same hex overlay pass.
-- **Hex shader uniforms:** hex_size, show_grid, grid_fade_start, grid_fade_end, altitude, hovered_hex_center, selected_hex_center, selection_time. Set by TerrainLoader (_ready) for size/fade; by Camera for altitude, hover, selection, selection_time, show_grid (F1).
-- **Grid lines:** world_to_axial / axial_round / hex_dist; dist_from_edge < half LINE_WIDTH → black line, alpha 0.6 × grid_fade_alpha (fade by altitude between grid_fade_start and grid_fade_end).
-- **Hover:** Raycast every 3rd frame in camera; hit position → axial hex center; hex_mat.set_shader_parameter("hovered_hex_center", center). Shader: is_hovered → white border + alpha max 0.08.
-- **Selection:** Left click → raycast → hex center; if same as current selection → clear (HexSelector.clear_selection, selected_hex_center = sentinel); else set_selected_hex(center), selected_hex_center = center, selection_time = 0. HexSelector builds slice mesh, adds slice node. Camera updates selected_hex_center and selection_time on hex material.
-- **Cutout/shadow:** In fragment, inside_cutout = (dist_from_sel_center <= hex_radius + CUTOUT_MARGIN_M). If inside_cutout → dark albedo + alpha 0.95×tint_fade. Selection also draws golden border/glow inside hex and surrounding darken for nearby hexes.
-
-### 2.4 Hex Slice (Physical Selection)
-
-- **Height data:** HexSelector calls `_chunk_manager.get_height_at(world_x, world_z)`. ChunkManager forwards to `terrain_loader.get_height_at(world_x, world_z)`. TerrainLoader: chunk key from world XZ (LOD 0 chunk index), path = lod0 chunk PNG path; if path not in _height_cache returns -1. Else bilinear interpolate from cache. Height cache is filled when async load completes (ChunkManager passes heights_for_cache/path_for_cache to terrain_loader._add_to_height_cache).
-- **Slice mesh:** `_build_slice_mesh()`: boundary vertices from 6 hex edges (BOUNDARY_STEP_M 25 m), heights from get_height_at (fallback 0 if -1). Rectangular grid clipped to hex (GRID_STEP_M 50 m), row intersection with hex for left/right X; only vertices inside hex; height at each grid point from get_height_at. Top surface triangulation (CCW), then _compute_grid_normals for top only. Walls: consecutive boundary segments, quads (top/bottom), earth color. Single ArrayMesh with ARRAY_VERTEX, COLOR, NORMAL, INDEX. Golden rim: _build_golden_rim_mesh() — 6 corner positions + height at each, LINE_STRIP with emissive material, child of slice_instance.
-- **Animation:** _process: _lift_t < 1 → ease-out to 1 over LIFT_DURATION_S, position.y = ease_out * LIFT_TOP_M; else position.y = LIFT_TOP_M + OSCILLATION_AMP_M * sin(TAU * OSCILLATION_HZ * _selection_time). Material emission driven by lift factor.
-- **Deselection:** clear_selection() → slice_instance.queue_free(), _slice_instance = null, _slice_mesh = null.
-
-### 2.5 Camera System
-
-- **Movement:** WASD → _pan(direction, delta); speed = pan_speed * (orbit_distance/1000), × speed_boost if Space. Forward/right from basis, target_position += movement. Zoom: scroll → _zoom(direction); target_orbit_distance *= (1 ± 0.15), clamped 500–5,000,000 m. Orbit: middle mouse drag → orbit_yaw, orbit_pitch (clamped 10–89). _update_camera_transform(): position = target + spherical offset; raycast down for terrain height; if position.y < terrain_height + min_camera_clearance, push camera up and adjust orbit_distance.
-- **Altitude:** orbit_distance (or position.y fallback) passed to shaders as altitude. Far plane: if orbit_distance > 1,000,000 then far = 10,000,000 else 2,000,000.
-- **Hover raycast:** In _update_hex_grid_interaction(), every 3rd frame (_hover_raycast_frame % 3 == 0): ray from camera through mouse; intersect collision_mask 1; hit → hex center from axial round; set hovered_hex_center on hex material. Miss → hovered_hex_center = (999999, 999999).
-- **Selection/deselection:** Left click → _handle_hex_selection_click. Raycast; if hit, get_lod_at_world_position(hit_pos); if LOD ≥ 3 show "Zoom in to select" and return. Else compute hex center; if same as _selected_hex_center → clear (HexSelector.clear_selection, sentinel); else set_selected_hex(center). Then _update_hex_selection_uniform() (selected_hex_center, selection_time). _selection_time += delta in _process.
-- **Uniform updates per frame:** _update_hex_grid_interaction() sets terrain material (altitude, camera_position, terrain_center_xz, terrain_radius_m) and hex material (altitude, selection_time, selected_hex_center, and hovered_hex_center when raycast runs).
+**Summary:** Hex grid is drawn in **terrain.gdshader** (world-space lines). Selection/hover/rim are in **hex_overlay_screen.glsl** (screen-space compositor). No `hex_grid.gdshader` next_pass; `hex_grid_OLD.gdshader` is archived. No `hex_grid_mesh.gd` in repo (PROGRESS refers to it; current design uses terrain shader for grid).
 
 ---
 
-## Section 3: Known Bugs (Verified by Code Reading)
+## 2. Architecture Map
 
-### 3.1 Multiple hex grids visible simultaneously
+### 2.1 Scene Tree
 
-- **Symptom:** Multiple terrain chunks covering the same area are visible at once, so the hex overlay (next_pass on the shared material) draws on each visible chunk and the grid appears duplicated.
-- **Root cause (code):**  
-  - **Visibility logic:** In `_update_chunk_visibility()` (chunk_manager.gd 558–569), a non–LOD 0 chunk is hidden only if all four finer children exist in `loaded_chunks`. So if the desired set has both a coarse chunk and one or more of its children, the coarse chunk stays visible until all four children are *loaded*. During loading, e.g. one LOD 1 chunk and two LOD 0 chunks may be visible for the same area.  
-  - **Expand LOD 0 to full blocks:** `_expand_lod0_to_full_blocks(desired)` (chunk_manager.gd 663–699) only ensures that for each LOD 0–3 chunk in desired, the other three siblings of its 2×2 block are *in the desired set*. It does not remove or hide coarser LODs from the desired set; it only adds missing siblings so that when all are loaded, the parent can be hidden. So the desired set can still contain both a parent (e.g. LOD 2) and its children (LOD 1/0).  
-  - **Race:** When a chunk is added in _do_one_phase_b_step (step 2), it is added to loaded_chunks and the scene in the same frame. _update_chunk_visibility() is called at the end of _update_chunks(), which runs on the timer (every 0.25–0.5 s). So there is a window where a new chunk is visible and its parent has not yet been hidden because visibility is not re-evaluated until the next _update_chunks().  
-  - **Overlay duplication:** The hex overlay is next_pass on the *shared* material. Every MeshInstance3D that uses that material draws the same overlay. So if two chunk meshes covering the same screen area are visible (e.g. one LOD 1 and one LOD 0 overlapping), the overlay is drawn twice for that area. There is no per-chunk or per-region switch to disable the overlay on coarser chunks; visibility is by chunk_node.visible, and both can be true.
-- **Where:** chunk_manager.gd: _update_chunk_visibility() 558–569; _expand_lod0_to_full_blocks 673–668; _update_chunks() calls _update_chunk_visibility() at line 569; _do_one_phase_b_step 417–428.
-- **Fix (brief):** (1) Call _update_chunk_visibility() immediately after adding a chunk in Phase B (and optionally once per frame when load_queue or _pending_phase_b is non-empty) so visibility updates as soon as children exist. (2) Optionally, in desired set computation, when a 2×2 block of finer LOD is complete in desired, do not request the parent (so coarse chunk is never loaded for that area); or keep current load logic but ensure visibility is updated every frame while streaming. (3) To avoid double overlay when two LODs are visible: either use a single full-screen hex pass instead of next_pass per chunk, or mark overlay draw only for the “primary” LOD per region (e.g. finest LOD covering camera).
-- **Risk of fix:** Changing desired set to omit parents when children are present could change load order and memory; per-frame visibility may add cost; single overlay pass would require architectural change.
+- **Main scene:** `scenes/terrain_demo.tscn` (run/main_scene in project.godot).
+- **Root:** `Node3D` "TerrainDemo".
+  - **ProfilingDriver** (Node) — script: profiling_camera_driver.gd.
+  - **DiagnosticCameraDriver** (Node) — script: diagnostic_camera_driver.gd.
+  - **TerrainLoader** (Node) — script: terrain_loader.gd; loads metadata, creates shared_terrain_material (terrain.gdshader), shared_terrain_material_lod2plus; no next_pass.
+  - **ChunkManager** (Node3D) — script: chunk_manager.gd; owns TerrainChunks (Node3D), TerrainCollision (StaticBody3D), overview plane (if metadata has overview_texture).
+  - **HexSelector** (Node3D) — script: hex_selector.gd; builds slice mesh on selection, adds MeshInstance3D as child.
+  - **Camera3D** — script: basic_camera.gd; orbit, pan, zoom; raycast for hover/selection; updates terrain material and HexOverlayCompositor.
+  - **DirectionalLight3D**
+  - **WorldEnvironment** — environment (sky, tonemap); **Compositor** is created/updated by camera (_ensure_hex_compositor) and holds HexOverlayCompositor effect.
+  - **FPSCounter** (CanvasLayer) — Label, fps_counter.gd.
+  - **LoadingScreen** (CanvasLayer) — loading_screen.gd.
+- Chunk nodes: MeshInstance3D "Chunk_LOD{l}_{x}_{y}" under TerrainChunks; LOD 0–1 use shared_terrain_material, LOD 2+ use shared_terrain_material_lod2plus. Both use same terrain.gdshader (with in-shader hex grid). Collision shapes under TerrainCollision (LOD 0–1 only).
 
-### 3.2 Terrain looks transparent / hex grid shows through terrain
+### 2.2 Data Flow
 
-- **Symptom:** Terrain appears transparent or the hex grid is visible “through” the terrain.
-- **Root cause (code):**  
-  - **Terrain shader:** terrain.gdshader has `render_mode blend_mix, depth_draw_opaque`. So terrain writes depth and is opaque; it does not use alpha.  
-  - **Hex overlay:** hex_grid.gdshader has `depth_draw_never, depth_test_disabled`. So the overlay does not read or write depth; it draws on top of whatever was drawn before, in blend_mix.  
-  - **Hex fragment alpha:** In hex_grid.gdshader fragment(), `albedo` and `alpha` start at 0. They are set only when: (1) show_grid && grid line (alpha max 0.6×line_alpha), (2) is_hovered (alpha max 0.08 and line alpha), (3) has_selection: inside_cutout (alpha up to 0.95×tint_fade), is_selected (golden tint/border/glow alpha), or !is_selected nearby (alpha 0.15×darken_fade). So for pixels with no grid, no hover, no selection: alpha remains 0. ALPHA = alpha is written at line 174. So “empty” overlay pixels have alpha 0. With blend_mix, that should not tint the terrain.  
-  - **Possible causes if bug persists:** (1) Driver or Godot version treating alpha or blend differently. (2) Order of draws: if overlay is drawn before terrain for some chunks, terrain would draw on top; but next_pass runs after main pass for the same mesh, so terrain draws first. (3) If there is a second camera or viewport, or if terrain_chunks group returns a chunk that doesn’t use the shared material, wrong material could be updated. (4) Default shader ALPHA: in Godot, if the shader doesn’t set ALPHA, it may default to 1.0; this shader sets ALPHA = alpha (0 where no overlay). So by code, empty overlay areas should be fully transparent.
-- **Where:** rendering/terrain.gdshader line 2 (depth_draw_opaque); rendering/hex_grid.gdshader lines 2, 76–175 (alpha only set for grid/hover/selection), 174 (ALPHA = alpha).
-- **Fix (brief):** Ensure ALPHA is explicitly 0 when no overlay effect (already done). If bug reproduces, verify render order and that all terrain chunks use the same material; add explicit ALPHA = 0 at start of fragment and only raise where needed.
-- **Risk of fix:** Low.
+1. **SRTM → processed chunks:** `tools/process_terrain.py` downloads SRTM (.hgt), merges, builds LOD pyramid, writes PNGs to `data/terrain/chunks/lod{N}/chunk_{x}_{y}.png` and `terrain_metadata.json`.
+2. **Engine load:** TerrainLoader._ready loads metadata, creates shared ShaderMaterial from `terrain.gdshader`. ChunkManager._ready reads resolution_m and LOD0 grid from loader, sets up overview plane, starts _initial_load().
+3. **Desired set:** ChunkManager._determine_desired_chunks(camera_pos): inner ring LOD 0 within INNER_RADIUS_M, per-cell LOD from LOD_DISTANCES_M + hysteresis; outer ring LOD 4; _expand_lod0_to_full_blocks ensures 2×2 blocks.
+4. **Phase A (async):** TerrainWorker.compute_chunk_data on WorkerThreadPool: decode PNG → heights, build vertices/normals/indices, return result with heights_for_cache/path_for_cache.
+5. **Phase B (main thread):** _drain_completed_async_to_phase_b pushes to _pending_phase_b. _do_one_phase_b_step: MESH → finish_load_step_mesh; SCENE → finish_load_step_scene (MeshInstance3D, material, add to chunks_container); COLLISION → finish_load_step_collision (LOD 0–1 only). Height cache updated from result in Phase B.
+6. **Rendering:** Each chunk MeshInstance3D uses shared_terrain_material (terrain.gdshader). Shader receives altitude, camera_position, terrain_center_xz, terrain_radius_m, show_hex_grid, hex_size (pointy-top radius). Hex grid lines are drawn in fragment via hex_edge_and_inside. After opaque pass, HexOverlayCompositor runs (PRE_TRANSPARENT): reads depth, reconstructs world XZ (camera-relative for precision), draws selection/hover/optional grid on color image.
 
-### 3.3 Hex slice appearance
+### 2.3 Hex System Overview
 
-- **Mesh building / triangulation:** In hex_selector.gd, top surface uses a rectangular grid clipped to hex; indices for each quad as (v00, v10, v01) and (v10, v11, v01). CCW from above. Wall quads: indices [v0_top, v0_top+1, v0_top+3, v0_top, v0_top+3, v0_top+2] — two triangles for quad top-left, bottom-left, bottom-right, top-right. Winding is consistent (CCW from outside per normal). Normals: top from _compute_grid_normals (face accumulation, normalized); walls use outwards vector from (pt.x, 0, pt.z). So triangulation and winding are consistent.
-- **get_height_at(-1):** When get_height_at returns -1 (chunk not in cache), _sample_height returns 0.0; _build_boundary_vertices and grid loop use height_fallback (from first boundary vertex with y>0 or min_terrain_y) or 0. So slice does not break; it may be flat or wrong in missing regions. >20% fail triggers push_warning.
-- **Vertex colors:** Top: _terrain_color(h) per elevation. Walls: earth Color(0.35, 0.25, 0.15). Correct.
-- **Golden rim:** _build_golden_rim_mesh() creates 6 vertices at hex corners with height from get_height_at (0 if -1), indices 0,1,2,3,4,5,0 for LINE_STRIP. So a closed hex outline at rim height. Material: unshaded, emissive gold. It is a child of _slice_instance so it moves with the slice. Position is local to slice (slice at _center_x, _center_z); rim vertices are in local coords (a.x, h + offset, a.y). So the rim is correctly positioned.
-- **Lift animation:** _process: _lift_t < 1 → _lift_t += rate, ease_out = 1.0 - (1.0 - _lift_t)^2, position.y = ease_out * LIFT_TOP_M. Else position.y = LIFT_TOP_M + 3*sin(TAU*_selection_time). So lift and oscillation are implemented.
-- **Potential issues:** (1) Rim is LINE_STRIP; on some GPUs line width may be 1 pixel or thin. (2) If many height samples fail, slice looks flat. (3) Wall quad winding: indices [v0_top, v0_top+1, v0_top+3, v0_top, v0_top+3, v0_top+2] — first tri (v0_top, v0_top+1, v0_top+3), second (v0_top, v0_top+3, v0_top+2). With vertices in order top-L, bottom-L, top-R, bottom-R, this is correct for two tris. No bug identified in slice geometry; status Fragile due to dependency on height cache.
+- **Coordinates:** Axial (q, r); cube (q, r, -q-r). **Pointy-top** orientation: vertex up (world X = horizontal, Z = vertical in XZ plane).
+- **HEX_SIZE_M (constants.gd):** 1000.0 m = **flat-to-flat** width. Pointy-top “radius” (center to vertex) = HEX_SIZE_M / √3 ≈ 577.35 m.
+- **Where hex is defined/used:**
+  - **basic_camera.gd:** world_to_axial and axial_to_world for raycast hit → hex center; hex_size = Constants.HEX_SIZE_M / sqrt(3.0) (pointy-top radius). Sends to terrain shader as hex_size (pointy-top) and to compositor (compositor uses HEX_SIZE_M = 1000 internally).
+  - **terrain.gdshader:** world_to_axial, axial_to_center, cube_round, seg_dist, edge_side, hex_edge_and_inside; draws grid lines (hex_line_mask) in fragment. Operates in world XZ; hex_size uniform = pointy-top radius.
+  - **hex_overlay_screen.glsl:** world_to_axial(pos, width), cube_round, axial_round, hex_dist; works in camera-relative XZ; params.hex_size = 1000 (flat-to-flat), size = width/SQRT_3, hex_radius = width*0.5.
+  - **hex_selector.gd:** _axial_round, _hex_corners_local (flat-top corners), _is_inside_hex; uses Constants.HEX_SIZE_M; R = hex_size / SQRT3 for grid.
+- **Hex selection:** Camera left-click → raycast → hit position → world_to_axial → axial_round → axial_to_world → hex center. If same as current → clear; else set_selected_hex(center). HexSelector builds slice mesh (height cache), adds slice node. Camera sets compositor selected_hex_center and selection_time. Compositor shader draws cutout, golden rim, hover.
+- **Hex grid rendering:** **Terrain shader** draws grid (world-space, one pass per chunk). **Compositor** can draw grid when draw_grid_lines = true (default false); grid is normally only in terrain shader.
 
-### 3.4 Other bugs from code reading
+### 2.4 Camera System
 
-- **LoadingScreen.update_progress chunk_name:** In loading_screen.gd update_progress(current, total, chunk_name), the status label is set to "Loading %s (%d/%d)" % [chunk_name, current, total]. ChunkManager calls update_progress(loaded_chunks.size(), want_count, "") with empty chunk_name, so label shows "Loading  (44/529)" etc. Minor UX; not a crash. **Where:** ui/loading_screen.gd 39; chunk_manager.gd 419.
-- **profiling_camera_driver uses initial_load_complete:** It reads _chunk_manager.get("initial_load_complete"). ChunkManager has initial_load_complete as a var (not @export). So .get() works. No bug.
-- **diagnostic_camera_driver get_diagnostic_snapshot:** ChunkManager defines get_diagnostic_snapshot(). Diagnostic driver calls it when has_method("get_diagnostic_snapshot"). OK.
-- **Null refs:** ChunkManager _ready gets loading_screen from /root/TerrainDemo/LoadingScreen or /root/Node3D/LoadingScreen; if null, no crash, just no loading UI. HexSelector _chunk_manager from get_parent().get_node_or_null("ChunkManager") — if parent is TerrainDemo, ChunkManager is sibling; OK. set_selected_hex checks _chunk_manager and has_method("get_height_at") and returns early if not; safe.
-- **Hex axial round in camera vs shader:** Camera uses _axial_round (cube_round) in GDScript; shader uses axial_round (cube_round) in GLSL. Both use same formula (round cube, resolve tie by largest diff). Should match.
-- **TerrainLoader resolution_m from metadata:** TerrainLoader loads resolution_m from metadata (default 30). ChunkManager overwrites _resolution_m from terrain_loader.resolution_m in _ready. So Europe (90) and Alps (30) both supported. OK.
-- **Unused _verify_no_overlaps:** chunk_manager.gd defines _verify_no_overlaps(chunks) but it is never called. Dead code; no runtime effect.
-- **Constants.LOD_DISTANCES_M vs chunk_manager LOD_DISTANCES_M:** config/constants.gd has LOD_DISTANCES_M [0, 10k, 25k, 50k, 100k]. chunk_manager.gd defines its own const LOD_DISTANCES_M [0, 50000, 75000, 200000, 500000]. So the engine uses the chunk_manager values (continental scale); Constants is not used for LOD distances. Fragile: two sources of truth.
+- **Movement:** WASD → _pan (forward/right from basis, target_position += movement). Speed = pan_speed * (orbit_distance/1000), × speed_boost with Space. Zoom: scroll → target_orbit_distance *= (1 ± 0.15), clamped 500–5,000,000 m. Orbit: middle mouse → orbit_yaw, orbit_pitch (clamped 10–89°).
+- **Transform:** position = target_position + spherical offset; raycast down for terrain height; if position.y < terrain_height + min_camera_clearance, push camera up and adjust orbit_distance. look_at(target_position, UP).
+- **Far plane:** orbit_distance > 1,000,000 → far = 10,000,000 else 2,000,000.
+- **Hex:** Hover raycast every 3rd frame; hit → hex center → compositor.hovered_hex_center. Left click → _handle_hex_selection_click → selected_hex_center, HexSelector.set_selected_hex/clear_selection, _update_hex_selection_uniform. LOD ≥ 3 at hit shows “Zoom in to select”.
+- **Uniforms:** _update_hex_grid_interaction sets terrain material (altitude, camera_position, terrain_center_xz, terrain_radius_m, show_hex_grid, hex_size = HEX_SIZE_M/sqrt(3)) and compositor (altitude, camera_position, selection_time, selected_hex_center, show_grid). F1 toggles grid; F2/F3/F4/F6 hex debug.
 
----
+### 2.5 Rendering Pipeline
 
-## Section 4: Fragile Code / Technical Debt
-
-1. **LOD distance and grid constants duplicated:** ChunkManager has its own LOD_DISTANCES_M, INNER_RADIUS_M, etc. Constants.gd has different LOD_DISTANCES_M and streaming-related constants. Changing one does not change the other; continental tuning is in ChunkManager only.
-2. **Shared material via first chunk in group:** Camera gets terrain material with get_first_node_in_group("terrain_chunks"). Order is undefined; if the “first” chunk is unloaded or hidden, the next frame a different chunk may be first. So far all chunks share the same material, so it works, but it’s fragile if chunks ever get different materials or if visibility/order changes.
-3. **Height cache key is LOD 0 path only:** get_height_at uses LOD 0 chunk path; cache is populated when LOD 0 chunks complete async load. If the user selects a hex in an area where only LOD 1+ is loaded, get_height_at returns -1 and slice uses fallback 0 or boundary average. So slice is fragile at coarse LOD or before LOD 0 has loaded.
-4. **Error handling gaps:** TerrainLoader load_chunk returns null if file not found or heights empty; ChunkManager sync load path (_load_chunk) push_errors but async path only drops the chunk (computed.is_empty() or !last_desired.has(chunk_key) → continue). Missing PNG or decode failure for one chunk does not crash but leaves a hole. No retry or user-facing message. Overview plane: if overview texture file missing, push_warning and skip; scene runs without overview.
-5. **Per-frame allocations:** _update_chunks builds to_load, to_unload_candidates, cell_min_lod dict, and various temp arrays each run. For 500+ desired chunks and 44–75 loaded, this is acceptable but could be optimized (reuse arrays, reduce dict allocations).
-6. **Assumptions about data format:** TerrainLoader assumes 16-bit grayscale PNG; raw parser expects exact IHDR/IDAT structure. If a chunk is 8-bit or different format, fallback to Image.load and 8-bit path with push_error. process_terrain.py outputs 16-bit; any other pipeline must match.
-7. **Debug prints not gated:** Many print() calls are behind DEBUG_STREAMING_TIMING or DEBUG_DIAGNOSTIC, but e.g. "ChunkManager: LOD0 grid...", "Initial Load (async)", "Overview plane added", "Terrain metadata loaded", "TerrainLoader: Unified terrain shader loaded.", "Camera initialized...", "DEBUG: Left Click Detected", "DEBUG: Could not find hex overlay material" are ungated. Left-click and "Could not find hex overlay" can spam or appear in production.
-8. **Dead shader files:** overview.gdshader and hex_overlay.gdshader remain in the repo; PROGRESS says they were removed. Can cause confusion or accidental use.
+- **Terrain:** terrain.gdshader — spatial, blend_mix, depth_draw_opaque. Vertex: world pos, elevation, world normal. Fragment: water/terrain color, overview blend, desaturation, edge fade, fog, **hex grid** (hex_edge_and_inside → hex_line_mask, fwidth/smoothstep, mix with hex_line_color).
+- **Hex overlay:** HexOverlayCompositor (CompositorEffect, PRE_TRANSPARENT). Compute shader hex_overlay_screen.glsl: reads resolved/raw depth, inv_projection + inv_view → world position; camera-relative XZ; grid (if draw_grid_lines), hover, selection (cutout, rim, glow, darken). Single fullscreen pass; no per-chunk overlay.
+- **Overview plane:** ChunkManager creates quad with StandardMaterial3D (overview texture) at Y = -20 when metadata has overview_texture.
 
 ---
 
-## Section 5: What's Actually Working Well
+## 3. Hex Grid Shader — Deep Dive
 
-1. **Async load pipeline:** Phase A in TerrainWorker (static, no node refs) avoids “previously freed” and editor freeze. Phase B micro-steps (MESH → SCENE → COLLISION) with frame budget and minimum 1 step per frame keep loading responsive. Height cache is filled from worker result on main thread, so get_height_at works after LOD 0 loads.
-2. **LOD visibility rule:** “Hide coarse if all four finer children are loaded” is simple and correct in principle; the only issue is timing (visibility updated on timer, not immediately when a child is added).
-3. **Unified terrain + overview:** One shader for all LODs with altitude-based overview blend; overview plane at Y=-20 fills gaps. Same world extent in metadata, ChunkManager plane, and shader overview_origin/size avoids misalignment.
-4. **Hex overlay decoupled:** Hex logic is entirely in hex_grid.gdshader (next_pass). Selection is physical slice in HexSelector using height cache. No terrain vertex modification; clear separation.
-5. **Continental scale parameters:** LOD distances 0–50 km, 50–75 km, … 500 km+ and altitude gate (no LOD 0 above 70 km) avoid load-then-unload flash and match zoom-out feel. Deferred unload with “covered by finer” check avoids holes; burst unload spread avoids hitches.
-6. **Camera and collision:** Terrain clearance raycast keeps camera above terrain. Collision only LOD 0–1; LOD 2+ skip collision (finish_load_step_collision returns early). Hex raycast uses same collision; LOD 3+ selection disabled with message.
-7. **Constants and metadata:** resolution_m, chunk_size_px, grid dimensions from terrain_metadata.json support different regions (Europe 90 m, Alps 30 m). process_terrain.py and engine share SEA_LEVEL_UINT16 and overview coloring logic.
+Two places implement hex logic: **terrain.gdshader** (grid lines on terrain) and **hex_overlay_screen.glsl** (compositor: selection/hover, optional grid). Both are documented below.
+
+### 3.1 Terrain shader (terrain.gdshader)
+
+#### Uniforms (hex-related and main)
+
+| Name | Type | Default | Purpose |
+|------|------|---------|--------|
+| hex_size | float | 577.35 | Pointy-top radius (center to vertex); comment: HEX_SIZE_M/sqrt(3). |
+| hex_line_width | float | 22.0 | Line width for grid (world units). |
+| hex_line_softness | float | 5.0 | Anti-alias (fwidth scale). |
+| hex_grid_strength | float | 0.55 | Mix strength for grid. |
+| hex_line_color | vec3 | (0.10, 0.12, 0.08) | Grid line color. |
+| show_hex_grid | bool | true | Toggle grid. |
+| altitude, camera_position, terrain_center_xz, terrain_radius_m, overview_texture, overview_origin, overview_size, use_overview | (various) | — | Terrain/fog/overview. |
+
+#### Vertex shader
+
+```gdshader
+void vertex() {
+	vec4 world_pos = MODEL_MATRIX * vec4(VERTEX, 1.0);
+	v_world_pos = world_pos.xyz;
+	v_elevation = world_pos.y;
+	v_world_normal = (MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz;
+}
+```
+
+No hex-specific vertex logic; world position and normal passed to fragment.
+
+#### Fragment shader flow (hex part)
+
+1. Compute terrain/water and overview blend, desaturation, edge fade, fog → base_col.
+2. If show_hex_grid: call `hex_edge_and_inside(v_world_pos.xz, hex_size)` → (edge_d, inside). Line mask: `hex_line_mask = (1.0 - smoothstep(hex_line_width - aa, hex_line_width + aa, d)) * inside` with `aa = fwidth(d) * hex_line_softness`. Optional: mask *= smoothstep(0.35, 0.65, n.y) (reduce on steep slopes). base_col is mixed with hex_line_color and darkening by hex_line_mask * hex_grid_strength.
+3. Output ALBEDO, ROUGHNESS, METALLIC, RIM, RIM_TINT; EMISSION = 0.
+
+#### Hex functions in terrain.gdshader (exact code)
+
+**world_to_axial:**
+
+```gdshader
+vec2 world_to_axial(vec2 xz, float size) {
+	return vec2((2.0/3.0 * xz.x) / size, (-1.0/3.0 * xz.x + sqrt(3.0)/3.0 * xz.y) / size);
+}
+```
+
+- Input: world XZ, pointy-top `size` (center-to-vertex).
+- Output: axial (q, r). Coordinate space: world XZ; same formula as standard pointy-top axial (x along flat edge, y up in 2D = Z in world).
+
+**axial_to_center:**
+
+```gdshader
+vec2 axial_to_center(vec2 axial, float size) {
+	return vec2(size * (1.5 * axial.x), size * (sqrt(3.0)/2.0 * axial.x + sqrt(3.0) * axial.y));
+}
+```
+
+- Converts axial (q, r) to world center XZ. Uses pointy-top layout: cx = size * 1.5*q, cy = size * (√3/2 * q + √3 * r).
+
+**cube_round:**
+
+```gdshader
+vec3 cube_round(vec3 c) {
+	vec3 r = round(c);
+	vec3 d = abs(r - c);
+	if (d.x > d.y && d.x > d.z) r.x = -r.y - r.z;
+	else if (d.y > d.z) r.y = -r.x - r.z;
+	else r.z = -r.x - r.y;
+	return r;
+}
+```
+
+- Cube coordinates (x,y,z) with x+y+z=0; tie-break by largest residual.
+
+**seg_dist (point-to-segment distance):**
+
+```gdshader
+float seg_dist(vec2 p, vec2 a, vec2 b) {
+	vec2 pa = p - a, ba = b - a;
+	float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+	return length(pa - ba * h);
+}
+```
+
+**edge_side (inside/outside edge):**
+
+```gdshader
+float edge_side(vec2 p, vec2 a, vec2 b) {
+	vec2 e = b - a;
+	return (p.x - a.x) * e.y - (p.y - a.y) * e.x;
+}
+```
+
+- Positive = inside (left of directed edge a→b).
+
+**hex_edge_and_inside:**
+
+```gdshader
+vec2 hex_edge_and_inside(vec2 world_xz, float size) {
+	vec2 axial = world_to_axial(world_xz, size);
+	vec3 r = cube_round(vec3(axial.x, -axial.x - axial.y, axial.y));
+	vec2 center = axial_to_center(vec2(r.x, r.z), size);
+	vec2 p = world_xz - center;
+	float k = size;
+	float c = 0.866025, s = 0.5;
+	vec2 v0 = k * vec2(0.0, 1.0), v1 = k * vec2(c, s), v2 = k * vec2(c, -s);
+	vec2 v3 = k * vec2(0.0, -1.0), v4 = k * vec2(-c, -s), v5 = k * vec2(-c, s);
+	float d0 = seg_dist(p, v0, v1), d1 = seg_dist(p, v1, v2), d2 = seg_dist(p, v2, v3);
+	float d3 = seg_dist(p, v3, v4), d4 = seg_dist(p, v4, v5), d5 = seg_dist(p, v5, v0);
+	float edge_d = min(min(min(d0, d1), min(d2, d3)), min(d4, d5));
+	float in0 = edge_side(p, v0, v1), in1 = edge_side(p, v1, v2), in2 = edge_side(p, v2, v3);
+	float in3 = edge_side(p, v3, v4), in4 = edge_side(p, v4, v5), in5 = edge_side(p, v5, v0);
+	float inside = (in0 >= 0.0 && in1 >= 0.0 && in2 >= 0.0 && in3 >= 0.0 && in4 >= 0.0 && in5 >= 0.0) ? 1.0 : 0.0;
+	return vec2(edge_d, inside);
+}
+```
+
+- Cube from axial: (q, -q-r, r); then axial from cube (r.x, r.z) = (q, r). Six vertices in pointy-top: (0,1), (c,s), (c,-s), (0,-1), (-c,-s), (-c,s) with c≈0.866, s=0.5. **All six edges** used for seg_dist and edge_side. Returns (min distance to any edge, 1 if inside cell else 0).
+
+#### Line rendering (terrain)
+
+- **Distance:** `edge_d` = minimum of the six seg_dist values (distance to nearest edge).
+- **Inside:** Only draw line when `inside == 1.0` (no “gap triangles” outside cell).
+- **Smoothing:** `aa = fwidth(d) * hex_line_softness`; `hex_line_mask = (1.0 - smoothstep(hex_line_width - aa, hex_line_width + aa, d)) * inside`.
+- **Thickness:** Controlled by uniform `hex_line_width` (default 22).
 
 ---
 
-## Section 6: Recommended Fix Order
+### 3.2 Compositor shader (hex_overlay_screen.glsl)
 
-1. **Multiple hex grids visible** — Why first: Directly visible bug; users see double grid. Fix: call _update_chunk_visibility() after each Phase B chunk add (and/or every frame while streaming). Risk: low. Complexity: small.
-2. **Ungated debug prints** — Why: Reduces console noise and avoids “DEBUG: Left Click” in production. Remove or gate “DEBUG: Left Click”, “Could not find hex overlay”, and other always-on prints. Risk: low. Complexity: small.
-3. **LoadingScreen progress label** — Why: Pass current chunk key or “…” from ChunkManager to update_progress so label shows “Loading lod0_12_34 (44/529)”. Risk: low. Complexity: small.
-4. **Single source of truth for LOD distances** — Why: Prevents drift between Constants and ChunkManager; makes tuning one place. Move continental LOD_DISTANCES_M and related constants to Constants or to an autoload/config; ChunkManager reads them. Risk: medium (must verify all reads). Complexity: small.
-5. **Hex overlay when two LODs visible** — Why: Even after visibility is updated promptly, there can be a frame or two where both coarse and fine are visible; or keep one-coarse-one-fine by design at boundaries. To avoid double overlay: consider single full-screen hex pass or “primary LOD” mask. Risk: medium. Complexity: medium–large.
-6. **Terrain transparent / grid through terrain** — Why: If still reported, verify ALPHA and draw order; add explicit alpha=0 for “no overlay” in shader. Risk: low. Complexity: small.
-7. **Dead code removal** — Why: Delete or stop tracking overview.gdshader and hex_overlay.gdshader; optionally remove _verify_no_overlaps or call it in debug. Risk: low. Complexity: small.
-8. **Height cache / slice at coarse LOD** — Why: Better UX when only LOD 1 is loaded: either sample from LOD 1 height (if cached) or show a clear “Load detail to select” message. Risk: medium. Complexity: medium.
+#### Uniforms (Params UBO)
+
+| Name | Type | Purpose |
+|------|------|--------|
+| inv_projection | mat4 | Clip → view. |
+| inv_view | mat4 | View → world (camera transform). |
+| hex_size | float | 1000 (flat-to-flat) in use. |
+| show_grid | float | 1 = true. |
+| altitude | float | For fade/scale. |
+| depth_ndc_flip | float | Use (1-depth) as NDC z if needed. |
+| camera_position | vec3 | For camera-relative XZ. |
+| time | float | Rim pulse. |
+| hovered_hex_center | vec2 | World XZ. |
+| selected_hex_center | vec2 | World XZ. |
+| selection_time | float | Fade-in. |
+| debug_visualization | float | 0/1/2. |
+| debug_depth | float | Depth debug view. |
+| use_resolved_depth | float | Depth texture source. |
+| draw_grid_lines | float | If false, grid only in terrain shader. |
+
+#### Constants
+
+- SQRT_3 = 1.73205080757
+- LINE_WIDTH = 12.0
+- CUTOUT_MARGIN_M = 15.0
+- GRID_FADE_START/END = 5000, 20000
+- HOVER_SENTINEL = -999990, SELECT_SENTINEL = 900000
+
+#### Main flow (compute main())
+
+1. uv = pixel; sample depth. If debug_depth → show depth quadrants and return.
+2. If depth_raw >= 1 or < 1e-6 → skip (sky).
+3. reconstruct_world_position(uv, depth) → world_pos; then camera-relative: world_xz = (world_pos - camera_xz).xz.
+4. dist_from_edge = hex_dist(world_xz, params.hex_size). Hover/selection in camera-relative axial; is_hovered, is_selected, has_selection.
+5. dist_from_sel_center = max(d1_sel, d2_sel, d3_sel) with d1=d_sel.y, d2=dot(d_sel,(√3/2,0.5)), d3=dot(d_sel,(√3/2,-0.5)) — **all three axes** (six edges).
+6. Grid (if draw_grid_lines && show_grid): dist_from_edge < half_width → line with smoothstep.
+7. Hover: is_hovered && !is_selected → line + 0.08 alpha.
+8. Selection: inside_cutout darken; is_selected → gold tint, golden rim (rim_distance = abs(hex_radius - dist_from_sel_center)), pulse emission; !is_selected nearby → darken.
+9. Blend to color_image; debug_visualization overwrites for depth or world XZ pattern.
+
+#### Hex functions in hex_overlay_screen.glsl (exact code)
+
+**world_to_axial:**
+
+```glsl
+vec2 world_to_axial(vec2 pos, float width) {
+	float size = width / SQRT_3;
+	float q = (2.0/3.0 * pos.x) / size;
+	float r = (-1.0/3.0 * pos.x + SQRT_3/3.0 * pos.y) / size;
+	return vec2(q, r);
+}
+```
+
+- `width` = flat-to-flat (params.hex_size = 1000); `size` = pointy-top radius. Same formula as terrain in world (x,y) = (X, Z).
+
+**cube_round:**
+
+```glsl
+vec3 cube_round(vec3 cube) {
+	float rx = round(cube.x);
+	float ry = round(cube.y);
+	float rz = round(cube.z);
+	float x_diff = abs(rx - cube.x);
+	float y_diff = abs(ry - cube.y);
+	float z_diff = abs(rz - cube.z);
+	if (x_diff > y_diff && x_diff > z_diff) {
+		rx = -ry - rz;
+	} else if (y_diff > z_diff) {
+		ry = -rx - rz;
+	} else {
+		rz = -rx - ry;
+	}
+	return vec3(rx, ry, rz);
+}
+```
+
+**axial_round:**
+
+```glsl
+vec2 axial_round(vec2 axial) {
+	return cube_round(vec3(axial.x, axial.y, -axial.x - axial.y)).xy;
+}
+```
+
+**hex_dist:**
+
+```glsl
+float hex_dist(vec2 p, float width) {
+	float size = width / SQRT_3;
+	vec2 q = world_to_axial(p, width);
+	vec2 center_axial = axial_round(q);
+	float size_ax = size;
+	float cx = size_ax * (3.0/2.0 * center_axial.x);
+	float cy = size_ax * (SQRT_3/2.0 * center_axial.x + SQRT_3 * center_axial.y);
+	vec2 center_world = vec2(cx, cy);
+	vec2 d = p - center_world;
+	float r = width * 0.5;
+	d = abs(d);
+	float d1 = d.y;
+	float d2 = abs(dot(d, vec2(SQRT_3/2.0, 0.5)));
+	float dist_from_center = max(d1, d2);
+	return r - dist_from_center;
+}
+```
+
+- Returns **signed distance**: positive inside hex, negative outside. `r = width*0.5` = half flat-to-flat = apothem (center to flat edge). For pointy-top, “distance from center” to edge is max(d1, d2) in the two perpendicular directions; here only **two** axes (d1, d2) are used. So **hex_dist** is a 2-axis “rounded rectangle” style distance (correct for flat-top hex when using half-width as radius). For full six-edge distance, terrain uses seg_dist to each edge; compositor uses this 2-axis formula for grid-line “near edge” and separately uses d1, d2, d3 for selection “inside hex” (see below).
+
+#### Line rendering (compositor)
+
+- Grid: `dist_from_edge < half_width` (LINE_WIDTH*0.5) → `line_alpha = (1.0 - smoothstep(half_width - 2.0, half_width, dist_from_edge)) * grid_fade_alpha`; albedo black, alpha max 0.6*line_alpha.
+- No fwidth (compute shader, no screen-space derivatives); fixed 2.0 pixel soften.
+- **Distance function:** hex_dist returns (r - max(d1,d2)) with r = width/2. So “distance from edge” is that value; near edges it becomes small/negative. For **six edges** the true distance would be min of six edge distances; this 2-axis max(d1,d2) is an approximation (flat-top hex as two-axis rounded shape). Terrain uses exact min-of-six seg_dist.
+
+### 3.3 Suspected issues (hex)
+
+1. **terrain.gdshader cube_round argument order:** `cube_round(vec3(axial.x, -axial.x - axial.y, axial.y))` uses (q, -q-r, r). Standard cube is (q, r, -q-r). So cube y = -q-r, cube z = r. Constraint holds. axial_from_cube = (r.x, r.z) = (q, r). Correct.
+2. **Compositor hex_dist:** Uses only d1 and d2 (two axes); flat-top hex has three directions. For **selection** the shader uses d1_sel, d2_sel, d3_sel (all three), so selection boundary is correct. For **grid line** thickness, hex_dist’s 2-axis formula can slightly misestimate distance to the third pair of edges → possible minor asymmetry or line-width variation at 60° angles.
+3. **Precision:** Compositor uses camera-relative world_xz to avoid large-world float precision loss; terrain uses absolute v_world_pos.xz (no camera-relative in terrain). At 2M+ m, terrain hex grid could show drift/sliding if precision is an issue.
+4. **hex_radius in compositor:** hex_radius = params.hex_size * 0.5 = 500 when hex_size=1000. That matches center-to-flat for flat-to-flat 1000. Selection cutout/rim use dist_from_sel_center with three axes; consistent.
 
 ---
 
-## Section 7: Code Metrics
+## 4. Hex Selection System
 
-- **Total lines of GDScript:** Sum of .gd files: 1318 + 957 + 291 + 396 + 612 + 174 + 44 + 43 + 298 + 117 = **4,250** (excluding .gdshader and other).
-- **Total lines of shader code:** terrain.gdshader 127 + hex_grid.gdshader 176 + overview.gdshader 46 + hex_overlay.gdshader 154 = **503** (active: 127 + 176 = 303).
-- **Exported variables:** 7 total — ChunkManager: DEBUG_STREAMING_TIMING, DEBUG_DIAGNOSTIC; TerrainLoader: DEBUG_CHUNK_TIMING, DEBUG_HEX_GRID; basic_camera: DEBUG_DIAGNOSTIC; diagnostic_camera_driver: enabled; profiling_camera_driver: enabled.
-- **Debug/diagnostic flags:** 5 (DEBUG_STREAMING_TIMING, DEBUG_DIAGNOSTIC x2, DEBUG_CHUNK_TIMING, DEBUG_HEX_GRID); plus enabled on the two drivers.
-- **TODO/FIXME/HACK comments:** 0 found in .gd, .gdshader, .py.
-- **Print statements:** ~60+ in .gd files total. Gated (behind DEBUG_* or enabled): most ChunkManager [Stream]/[LOD]/[TIME]/[DIAG]/[FRAME] prints, TerrainLoader [TIME]/[HEX]/[CACHE]/[ASYNC], TerrainWorker [HEIGHT]/[VERIFY], basic_camera [SHADER]/[VERIFY]/[HEX]/COLLISION, fps_counter [PERF], diagnostic and profiling drivers. Ungated: ChunkManager (e.g. “ChunkManager: LOD0 grid…”, “Initial Load (async)”, “Overview plane added”, “Initial load complete”, “Dynamic chunk streaming active”, “Loading %d chunks”, debug dump, some [Stream] Loaded/Unloaded when DEBUG_STREAMING_TIMING); TerrainLoader (“TerrainLoader: Hex overlay…”, “Overview texture loaded”, “Unified terrain shader loaded”, “Terrain metadata loaded”, “Generating mesh…”, “Generated %d vertices/triangles” when verbose); basic_camera (“Camera initialized…”, “DEBUG: Left Click Detected”, “DEBUG: Could not find hex overlay material”). So roughly ~25+ ungated prints, ~35+ gated.
+### 4.1 World-to-Hex Math (GDScript — basic_camera.gd)
+
+**On raycast hit (hit_pos = result.position):**
+
+```gdscript
+var width = Constants.HEX_SIZE_M
+var hex_size = width / sqrt(3.0)
+var q = (2.0 / 3.0 * hit_pos.x) / hex_size
+var r = (-1.0 / 3.0 * hit_pos.x + sqrt(3.0) / 3.0 * hit_pos.z) / hex_size
+var hex_axial = _axial_round(Vector2(q, r))
+var center_x = hex_size * (3.0 / 2.0 * hex_q)
+var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
+var center = Vector2(center_x, center_z)
+```
+
+- **world_to_axial:** q = (2/3 * x) / size, r = (-1/3 * x + √3/3 * z) / size, with size = HEX_SIZE_M/√3 (pointy-top radius). So **same formula** as terrain and compositor (with terrain/compositor using “size” or “width” as documented).
+- **axial_to_world (center):** cx = size * (3/2 * q), cz = size * (√3/2 * q + √3 * r). Matches terrain axial_to_center and compositor axial_to_world.
+
+### 4.2 Cube Round (GDScript)
+
+```gdscript
+func _cube_round(cube: Vector3) -> Vector2:
+	var rx = round(cube.x)
+	var ry = round(cube.y)
+	var rz = round(cube.z)
+	var x_diff = abs(rx - cube.x)
+	var y_diff = abs(ry - cube.y)
+	var z_diff = abs(rz - cube.z)
+	if x_diff > y_diff and x_diff > z_diff:
+		rx = - ry - rz
+	elif y_diff > z_diff:
+		ry = - rx - rz
+	else:
+		rz = - rx - ry
+	return Vector2(rx, ry)
+```
+
+- _axial_round(axial) calls _cube_round(Vector3(axial.x, axial.y, -axial.x - axial.y)). Same tie-break rule as shaders.
+
+### 4.3 Shader vs GDScript Consistency
+
+| Item | Terrain shader | Compositor GLSL | GDScript (camera) |
+|------|----------------|-----------------|--------------------|
+| world_to_axial | (2/3*x)/size, (-1/3*x+√3/3*z)/size | Same, size=width/√3 | Same, size=HEX_SIZE_M/√3 |
+| axial→world center | size*(1.5*q), size*(√3/2*q+√3*r) | size*(1.5*q), size*(√3/2*q+√3*r) | Same |
+| cube_round | (q,-q-r,r); tie largest residual | (q,r,-q-r); same tie | (q,r,-q-r); same tie |
+| hex “size” | pointy-top radius (577.35) | width=1000 → size=577.35 internally | hex_size=1000/√3 |
+
+- **Same coordinate system:** pointy-top axial; world X = first axis, world Z = second axis. Terrain passes hex_size as pointy-top radius; compositor receives flat-to-flat 1000 and derives size = 1000/√3. So **selection and grid use the same hex layout**. Possible subtle: terrain uses absolute world XZ; compositor uses camera-relative XZ and subtracts camera from hovered/selected center for comparison. If camera position is large, that keeps precision; axial comparison is then in the same relative space.
+
+### 4.4 Physical Slice Mechanism (hex_selector.gd)
+
+- **Trigger:** basic_camera calls hex_selector.set_selected_hex(center) with world XZ of hex center.
+- **Height:** _chunk_manager.get_height_at(world_x, world_z) → ChunkManager → TerrainLoader.get_height_at. Loader uses LOD 0 chunk path from world XZ, _height_cache[path], bilinear interpolation. Returns -1 if chunk not cached.
+- **Slice mesh:** _build_slice_mesh(): (1) Boundary: 6 edges, step BOUNDARY_STEP_M (25 m), heights from get_height_at. (2) Rectangular grid step GRID_STEP_M (50 m), clipped to hex via _hex_row_intersection_x and _is_inside_hex; vertices only inside hex; heights from get_height_at (fallback 0 if -1). (3) Triangulate top (CCW); _compute_grid_normals for top. (4) Walls: quads between consecutive boundary points, top/bottom (bottom = height - WALL_DEPTH_M). Single ArrayMesh; StandardMaterial3D with vertex_color_use_as_albedo.
+- **Rim:** No longer built as mesh; comment says rim is drawn in hex_overlay_screen.glsl (screen-space).
+- **Animation:** _process: _lift_t 0→1 over LIFT_DURATION_S, position.y = ease_out * LIFT_TOP_M; then position.y = LIFT_TOP_M + OSCILLATION_AMP_M * sin(TAU * OSCILLATION_HZ * _selection_time). Emission driven by lift factor.
+
+---
+
+## 5. Cross-System Consistency
+
+| Check | Result |
+|-------|--------|
+| hex_radius vs HEX_SIZE_M | Constants: HEX_SIZE_M = 1000 (flat-to-flat). Pointy-top radius = 1000/√3 ≈ 577.35. Terrain hex_size uniform = 577.35. Compositor hex_size = 1000, hex_radius = 500 (center to flat). HexSelector R = hex_size/SQRT3 ≈ 577.35 for grid. **Consistent.** |
+| Pointy-top vs flat-top | All axial math is **pointy-top** (vertex up). HexSelector _hex_corners_local uses flat-top **geometry** (flat edges horizontal) for slice boundary; corners are (0.5*size, 0), (0.25*size, size*√3/4), etc. So slice shape is flat-top; axial rounding elsewhere is pointy-top. Flat-top corners in local coords match the same physical hex (flat-to-flat = HEX_SIZE_M). **Consistent.** |
+| axial↔world in shader vs GDScript | Same formulas (see 4.3). **Consistent.** |
+| sqrt(3) / 2 factors | Terrain: axial_to_center uses size*(√3/2*q+√3*r) for second component. Camera: center_z = hex_size*(√3/2*q+√3*r). Compositor: cy = size_ax*(SQRT_3/2*center_axial.x + SQRT_3*center_axial.y). **Consistent.** |
+| Cube component order | Terrain: vec3(axial.x, -axial.x-axial.y, axial.y) = (q,-q-r,r). Compositor/camera: cube (q, r, -q-r); axial_round returns .xy so (q,r). Terrain cube_round returns vec3; then vec2(r.x, r.z) = (q,r). **Consistent.** |
+
+**Potential inconsistency:** Terrain does not use camera-relative coordinates; at very large world coordinates (e.g. 2e6 m) floating-point could cause grid to drift relative to selection. Compositor avoids this by using camera-relative XZ.
+
+---
+
+## 6. Constants & Configuration
+
+### 6.1 config/constants.gd
+
+- **Hex:** HEX_SIZE_M = 1000, HEX_WIDTH_M = 1000, HEX_HEIGHT_M = 866.025, HEX_VERTICES = 7.
+- **Grid visibility:** GRID_FADE_START_M = 5000, GRID_FADE_END_M = 20000, GRID_DEFAULT_VISIBLE = true.
+- **LOD:** LOD_LEVELS = 5, LOD_RESOLUTIONS_M, LOD_DISTANCES_M (0, 50k, 75k, 200k, 500k), LOD_HYSTERESIS = 0.1, INNER_RADIUS_M = 500000, VISIBLE_RADIUS_ALTITUDE_FACTOR = 2.5.
+- **Chunks:** CHUNK_SIZE_PX = 512, CHUNK_SIZE_M, TARGET_LOADED_CHUNKS, etc.
+- **Camera:** CAMERA_MIN/MAX_ALTITUDE_M, CAMERA_SPEED_FACTOR, pitch/zoom constants.
+- **Paths:** TERRAIN_DATA_PATH, CHUNK_PATH_PATTERN, METADATA_PATH, REGIONS_CONFIG_PATH.
+
+### 6.2 ChunkManager (duplicated / overrides)
+
+- INNER_RADIUS_M, VISIBLE_RADIUS_ALTITUDE_FACTOR duplicated (same values).
+- LOD_DISTANCES_M: constants.gd has [0, 50k, 75k, 200k, 500k]; ChunkManager uses its own const (same values in code). So no conflict but two places to change.
+
+### 6.3 Shader defaults
+
+- **terrain.gdshader:** hex_size = 577.35, hex_line_width = 22, hex_line_softness = 5, hex_grid_strength = 0.55, show_hex_grid = true. Overridden by camera: hex_size = Constants.HEX_SIZE_M/sqrt(3), show_hex_grid = _grid_visible.
+- **hex_overlay_screen.glsl:** LINE_WIDTH = 12, CUTOUT_MARGIN_M = 15, GRID_FADE_START/END = 5000/20000. Compositor: hex_size = Constants.HEX_SIZE_M (1000), draw_grid_lines = false.
+
+### 6.4 Python pipeline (process_terrain.py)
+
+- Region from config; resolution (srtm3 90 m); chunk_size 512; LOD levels; SEA_LEVEL_UINT16; output paths. Not loaded by engine; engine reads terrain_metadata.json.
+
+---
+
+## 7. Current State Assessment
+
+### 7.1 What Works
+
+- **Terrain streaming:** Phase A (worker) + Phase B (main thread) with frame budget; height cache for LOD 0; desired set and visibility logic clear.
+- **Single terrain material:** One shader for all LODs; overview blend and fog; no next_pass hex (avoids double grid).
+- **Hex overlay split:** Grid in terrain (world-space); selection/hover in compositor (one fullscreen pass, depth-reconstructed).
+- **Hex math alignment:** world_to_axial, cube_round, axial_to_world consistent across camera, terrain shader, and compositor; pointy-top; HEX_SIZE_M as flat-to-flat and derived pointy-top radius used correctly.
+- **Physical slice:** HexSelector builds mesh from height cache; lift and oscillation; rim in compositor.
+- **Camera:** Orbit, pan, zoom, terrain clearance; F1–F6 for grid and hex debug.
+
+### 7.2 What's Broken or Suspect
+
+- **Compositor hex_dist:** Two-axis distance for grid (d1, d2 only); selection correctly uses d1, d2, d3. Grid line thickness could be slightly non-uniform at 60° directions.
+- **Terrain at large world coordinates:** No camera-relative pass; possible precision drift at 2M+ m (documented in PROGRESS).
+- **LoadingScreen chunk_name:** ChunkManager calls update_progress(..., "") so label shows "Loading  (44/529)".
+- **LOD_DISTANCES_M / radius constants:** Defined in both constants.gd and ChunkManager; must be kept in sync manually.
+- **Ungated prints:** e.g. "Camera initialized...", "DEBUG: Left Click Detected", "=== SLICE DIAGNOSTIC ===" in hex_selector.
+
+### 7.3 Technical Debt
+
+- **hex_grid_OLD.gdshader:** Left on disk; superseded by terrain in-shader grid + compositor.
+- **HexSelector slice diagnostic:** Block of print() in set_selected_hex (lines 396–405) should be gated or removed.
+- **Shared material from first chunk:** Camera gets terrain material via get_first_node_in_group("terrain_chunks"); order undefined.
+- **Height cache:** Only LOD 0; get_height_at returns -1 if LOD 0 not loaded; slice can be flat or wrong in coarse regions.
+- **ChunkManager _verify_no_overlaps:** Defined but never called.
+
+### 7.4 Architecture Quality
+
+- **Separation of concerns:** Terrain loader (stateless load + cache), chunk manager (streaming, visibility), camera (input + uniforms), hex selector (slice mesh), compositor (screen-space overlay). Clear.
+- **Naming:** Scripts and nodes named by role; constants in one file with comments.
+- **Hex single source of truth:** HEX_SIZE_M in constants; camera and compositor read it; terrain gets pointy-top radius from camera. One semantic size; two representations (flat-to-flat vs pointy-top radius) documented and consistent.
+- **Documentation:** PROGRESS, HEX_OVERLAY_FINAL_SUMMARY, HEX_SELECTION_DIAGNOSTIC_REPORT, SSOT; useful for onboarding and hex pipeline.
 
 ---
 

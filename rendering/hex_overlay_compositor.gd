@@ -128,8 +128,9 @@ func _render_callback(p_effect_callback_type: int, p_render_data: RenderData) ->
 
 	# One-time matrix verification
 	if not _matrices_verified:
-		print("HexOverlayCompositor inv_proj diagonal: ", inv_proj.x.x, ", ", inv_proj.y.y, ", ", inv_proj.z.z, ", ", inv_proj.w.w)
-		print("HexOverlayCompositor inv_view (cam) origin: ", origin.x, ", ", origin.y, ", ", origin.z)
+		if OS.is_debug_build():
+			print("HexOverlayCompositor inv_proj diagonal: ", inv_proj.x.x, ", ", inv_proj.y.y, ", ", inv_proj.z.z, ", ", inv_proj.w.w)
+			print("HexOverlayCompositor inv_view (cam) origin: ", origin.x, ", ", origin.y, ", ", origin.z)
 		_matrices_verified = true
 
 	# Pack Params: inv_projection (64) + inv_view as 4 columns (64), then scalars at 128

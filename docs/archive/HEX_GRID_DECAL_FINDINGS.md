@@ -42,30 +42,30 @@
 
 | Aspect | Observation |
 |--------|-------------|
-| **Grid vs terrain** | The grid is a flat texture projected onto the terrain. It does not follow elevation or slope; it reads as a flat square overlay, not “painted on” the hills and valleys. |
-| **Grid vs selection** | The selected hex has the correct shape and is terrain-aware (lifted slice with contoured walls). The decal grid is a separate square that does not align with that same geometry in a visually coherent way — different coordinate system, no shared “lift” or rim, no sense that the selection is “on” the grid. |
+| **Grid vs terrain** | The grid is a flat texture projected onto the terrain. It does not follow elevation or slope; it reads as a flat square overlay, not "painted on" the hills and valleys. |
+| **Grid vs selection** | The selected hex has the correct shape and is terrain-aware (lifted slice with contoured walls). The decal grid is a separate square that does not align with that same geometry in a visually coherent way — different coordinate system, no shared "lift" or rim, no sense that the selection is "on" the grid. |
 | **Square following camera** | The 20 km × 20 km square moves with the look-at target. That keeps it under the view but reinforces the feeling of a floating overlay rather than a world-anchored grid. |
 | **Smoothness** | The result does not feel smooth or integrated: grid, selection, and terrain feel like three separate layers. |
 
-So the issue is not only “one bug” but that **the decal approach itself does not produce a unified, terrain-integrated hex experience**. The selection system (HexSelector) is terrain-aware and correct; the grid (decal) is flat and world-aligned in a way that does not match that.
+So the issue is not only "one bug" but that **the decal approach itself does not produce a unified, terrain-integrated hex experience**. The selection system (HexSelector) is terrain-aware and correct; the grid (decal) is flat and world-aligned in a way that does not match that.
 
 ---
 
 ## Recommendations for Next Steps
 
 1. **Treat decal grid as a stopgap, not the final solution**
-   - Keep it for “grid visible and togglable” but plan for a grid that is **terrain-aware** (e.g. lines at terrain height, or screen-space with stable world alignment).
+   - Keep it for "grid visible and togglable" but plan for a grid that is **terrain-aware** (e.g. lines at terrain height, or screen-space with stable world alignment).
 
 2. **Revisit screen-space compositor**
    - The compositor was disabled in favor of the decal because of issues (grid sliding, visibility). If those can be fixed (e.g. camera-relative coordinates for precision, consistent visibility), a **single** screen-space grid that shares the same world hex math as selection might give a more coherent look.
 
 3. **Unify grid and selection visually**
-   - Whatever replaces or complements the decal should feel like the same “layer” as the selected hex: same hex size, same alignment, and ideally shared logic (e.g. one world hex → one grid cell and one selection shape).
+   - Whatever replaces or complements the decal should feel like the same "layer" as the selected hex: same hex size, same alignment, and ideally shared logic (e.g. one world hex → one grid cell and one selection shape).
 
 4. **Preserve what we learned**
    - Do not rotate the decal (rotation breaks one axis).
    - Use `target_position` (look-at) for grid center when using a world-space overlay.
-   - Keep `DECAL_WORLD_SIZE` and the comment block in `hex_grid_mesh.gd` so future changes don’t reintroduce the “single line” or “grid moving with camera” regressions.
+   - Keep `DECAL_WORLD_SIZE` and the comment block in `hex_grid_mesh.gd` so future changes don't reintroduce the "single line" or "grid moving with camera" regressions.
 
 ---
 
@@ -74,4 +74,4 @@ So the issue is not only “one bug” but that **the decal approach itself does
 - **`rendering/hex_grid_mesh.gd`** — Decal setup, hex grid texture, `_draw_line`, `DECAL_WORLD_SIZE`, orientation comments.
 - **`rendering/basic_camera.gd`** — Grid center from `target_position`; compositor `show_grid = false` when decal used; F1 handling; visibility sync every frame.
 
-No changes to `core/hex_selector.gd`, `rendering/hex_overlay_compositor.gd`, or `hex_overlay_screen.glsl` in this session (per “no changes needed” / “reference only”).
+No changes to `core/hex_selector.gd`, `rendering/hex_overlay_compositor.gd`, or `hex_overlay_screen.glsl` in this session (per "no changes needed" / "reference only").

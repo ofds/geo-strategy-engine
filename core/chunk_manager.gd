@@ -2,10 +2,8 @@ extends Node3D
 ## Chunk Manager - Simple, reliable terrain streaming
 ## Every 0.5s: determine desired chunks, load closest 4, unload unwanted
 
-# LOD/streaming: from config/constants.gd (preload for LOD_*; locals for radius so analyzer resolves)
+# LOD/streaming: single source of truth in config/constants.gd
 const _Const := preload("res://config/constants.gd")
-const INNER_RADIUS_M: float = 500000.0  # keep in sync with Constants.INNER_RADIUS_M
-const VISIBLE_RADIUS_ALTITUDE_FACTOR: float = 2.5  # keep in sync with Constants.VISIBLE_RADIUS_ALTITUDE_FACTOR
 
 # References
 var terrain_loader: TerrainLoader = null
@@ -117,7 +115,8 @@ func _ready() -> void:
 	var mw = terrain_loader.terrain_metadata.get("master_heightmap_width", 16384)
 	var mh = terrain_loader.terrain_metadata.get("master_heightmap_height", 9216)
 	_lod0_grid = Vector2i((mw + 511) / 512, (mh + 511) / 512)
-	print("ChunkManager: LOD0 grid %d×%d, resolution %.1f m/px" % [_lod0_grid.x, _lod0_grid.y, _resolution_m])
+	if OS.is_debug_build():
+		print("ChunkManager: LOD0 grid %d×%d, resolution %.1f m/px" % [_lod0_grid.x, _lod0_grid.y, _resolution_m])
 	
 	# Continental overview plane (instant, gap-free at high zoom) — add first so chunks render on top
 	_setup_overview_plane()
@@ -146,7 +145,8 @@ func _ready() -> void:
 	if loading_screen:
 		await get_tree().process_frame
 	
-	print("\n=== ChunkManager: Initial Load (async) ===")
+	if OS.is_debug_build():
+		print("\n=== ChunkManager: Initial Load (async) ===")
 	_initial_load()
 	# initial_load_complete set in _process when initial_desired is fully loaded
 
@@ -217,7 +217,8 @@ func _setup_overview_plane() -> void:
 	overview_instance.position = Vector3(0.0, -20.0, 0.0)
 	overview_instance.add_to_group("overview_plane")
 	add_child(overview_instance)
-	print("ChunkManager: Overview plane added (%.0f × %.0f m, Y=-20, corner at world 0,0)" % [overview_w, overview_h])
+	if OS.is_debug_build():
+		print("ChunkManager: Overview plane added (%.0f × %.0f m, Y=-20, corner at world 0,0)" % [overview_w, overview_h])
 
 
 func _exit_tree() -> void:
@@ -459,9 +460,14 @@ func _process_initial_load() -> void:
 		initial_steps_done += 1
 		if step_time > budget_at_start:
 			break
-	# Update loading screen when a chunk finished during this loop (Fix 3: show chunk key)
+	# Update loading screen with meaningful chunk label (last completed or current in progress)
 	if loading_screen:
-		loading_screen.update_progress(loaded_chunks.size(), want_count, _last_phase_b_completed_chunk_key)
+		var display_chunk: String = _last_phase_b_completed_chunk_key
+		if display_chunk.is_empty() and _pending_phase_b.size() > 0:
+			display_chunk = _pending_phase_b[0].chunk_key
+		if display_chunk.is_empty():
+			display_chunk = "..."
+		loading_screen.update_progress(loaded_chunks.size(), want_count, display_chunk)
 	# Submit up to cap so we keep tasks in flight
 	while load_queue.size() > 0 and pending_loads.size() < _get_max_concurrent_loads():
 		var info = load_queue.pop_front()
@@ -484,12 +490,13 @@ func _process_initial_load() -> void:
 		initial_load_complete = true
 		if loading_screen:
 			loading_screen.hide_loading()
-		var lod_counts = [0, 0, 0, 0, 0]
-		for k in loaded_chunks.keys():
-			lod_counts[loaded_chunks[k].lod] += 1
-		print("=== Initial load complete: %d chunks, FPS: %d ===" % [loaded_chunks.size(), Engine.get_frames_per_second()])
-		print("[RESULT] Initial load: %d chunks, LODs: L0=%d L1=%d L2=%d L3=%d L4=%d, FPS after=%d" %
-			[loaded_chunks.size(), lod_counts[0], lod_counts[1], lod_counts[2], lod_counts[3], lod_counts[4], Engine.get_frames_per_second()])
+		if OS.is_debug_build():
+			var lod_counts = [0, 0, 0, 0, 0]
+			for k in loaded_chunks.keys():
+				lod_counts[loaded_chunks[k].lod] += 1
+			print("=== Initial load complete: %d chunks, FPS: %d ===" % [loaded_chunks.size(), Engine.get_frames_per_second()])
+			print("[RESULT] Initial load: %d chunks, LODs: L0=%d L1=%d L2=%d L3=%d L4=%d, FPS after=%d" %
+				[loaded_chunks.size(), lod_counts[0], lod_counts[1], lod_counts[2], lod_counts[3], lod_counts[4], Engine.get_frames_per_second()])
 		get_tree().create_timer(5.0).timeout.connect(_on_initial_load_delay_done)
 
 
@@ -582,18 +589,17 @@ func _do_one_phase_b_step() -> void:
 
 
 func _debug_dump_state() -> void:
+	if not OS.is_debug_build():
+		return
 	print("\n=== CHUNK MANAGER DEBUG ===")
 	print("Total chunks loaded: %d" % loaded_chunks.size())
-	
 	var lod_counts = [0, 0, 0, 0, 0]
 	for key in loaded_chunks.keys():
 		var chunk = loaded_chunks[key]
 		lod_counts[chunk.lod] += 1
-	
 	print("Chunks by LOD:")
 	for i in range(5):
 		print("  LOD %d: %d" % [i, lod_counts[i]])
-	
 	print("Camera position: %s" % _get_camera_ground_position())
 	print("===========================\n")
 
@@ -601,7 +607,8 @@ func _debug_dump_state() -> void:
 func _on_initial_load_delay_done() -> void:
 	if _exiting:
 		return
-	print("Dynamic chunk streaming active")
+	if OS.is_debug_build():
+		print("Dynamic chunk streaming active")
 
 
 func _initial_load() -> void:
@@ -627,7 +634,8 @@ func _initial_load() -> void:
 	)
 
 	initial_load_in_progress = true
-	print("Loading %d chunks (async)..." % desired.size())
+	if OS.is_debug_build():
+		print("Loading %d chunks (async)..." % desired.size())
 
 
 func _update_chunks() -> void:
@@ -950,7 +958,7 @@ func _is_cell_covered_by_loaded_desired(lod0_x: int, lod0_y: int, desired: Dicti
 
 func _determine_desired_chunks(camera_pos: Vector3) -> Dictionary:
 	var altitude = _get_camera_altitude()
-	var visible_radius: float = maxf(INNER_RADIUS_M, altitude * VISIBLE_RADIUS_ALTITUDE_FACTOR)
+	var visible_radius: float = maxf(_Const.INNER_RADIUS_M, altitude * _Const.VISIBLE_RADIUS_ALTITUDE_FACTOR)
 	_last_visible_radius = visible_radius
 
 	# Inner ring: LOD 0 cells within 500km (current behavior, ~529 cells max)
@@ -973,10 +981,10 @@ func _determine_desired_chunks(camera_pos: Vector3) -> Dictionary:
 
 
 func _determine_inner_chunks(camera_pos: Vector3, altitude: float) -> Dictionary:
-	"""Inner ring: LOD 0 cells within INNER_RADIUS_M (500km). Same logic as before — up to ~529 cells."""
+	"""Inner ring: LOD 0 cells within _Const.INNER_RADIUS_M (500km). Same logic as before — up to ~529 cells."""
 	var lod0_grid = _lod0_grid
 	var cell_size_m: float = 512.0 * _resolution_m
-	var cells_radius: int = int(ceil(INNER_RADIUS_M / cell_size_m))
+	var cells_radius: int = int(ceil(_Const.INNER_RADIUS_M / cell_size_m))
 
 	var camera_cell_x: int = int(camera_pos.x / cell_size_m)
 	var camera_cell_y: int = int(camera_pos.z / cell_size_m)
@@ -1059,7 +1067,7 @@ func _expand_lod0_to_full_blocks(desired: Dictionary) -> void:
 
 func _determine_outer_lod4_chunks(camera_pos: Vector3, visible_radius: float) -> Dictionary:
 	"""Outer ring: LOD 4 only, from 500km to visible_radius. Iterate LOD 4 chunk indices only (~20-30 chunks)."""
-	if visible_radius <= INNER_RADIUS_M:
+	if visible_radius <= _Const.INNER_RADIUS_M:
 		return {}
 	var lod0_grid = _lod0_grid
 	# LOD 4 grid size (each LOD 4 chunk = 16x16 LOD 0 cells)
@@ -1072,7 +1080,7 @@ func _determine_outer_lod4_chunks(camera_pos: Vector3, visible_radius: float) ->
 			var center = _get_chunk_center_world(cx, cy, 4)
 			var center_xz = Vector2(center.x, center.z)
 			var dist: float = camera_xz.distance_to(center_xz)
-			if dist > INNER_RADIUS_M and dist <= visible_radius:
+			if dist > _Const.INNER_RADIUS_M and dist <= visible_radius:
 				var chunk_key = "lod%d_x%d_y%d" % [4, cx, cy]
 				desired[chunk_key] = {"lod": 4, "x": cx, "y": cy}
 	return desired
@@ -1126,6 +1134,7 @@ func _verify_full_coverage_box(chunks: Dictionary, min_cx: int, max_cx: int, min
 		push_error("CRITICAL: %d box cells have no coverage: %s" % [uncovered_cells.size(), ", ".join(uncovered_cells.slice(0, 10))])
 
 
+## Debug utility — call manually to verify chunk overlap state. Not used in normal flow.
 func _verify_no_overlaps(chunks: Dictionary) -> void:
 	"""Verify that no two chunks in the set have overlapping world-space bounds."""
 	var chunk_list: Array = []

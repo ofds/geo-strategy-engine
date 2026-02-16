@@ -23,7 +23,7 @@
 
 ## What Still Fails
 
-- **Grid moves with camera on pan:** When the camera is panned, the hex grid (or a “hex square” under the camera) moves with the view instead of staying on the terrain. So the grid does not behave like an infinite, world-locked overlay.
+- **Grid moves with camera on pan:** When the camera is panned, the hex grid (or a "hex square" under the camera) moves with the view instead of staying on the terrain. So the grid does not behave like an infinite, world-locked overlay.
 - **Small square of hexes:** The grid often appears only in a limited region (e.g. a square under the camera) instead of across the full visible terrain.
 
 Together, this suggests the **reconstructed world position from the depth buffer** is wrong or inconsistent: either we are not getting the correct depth for the main scene, or the unprojection (clip → view → world) does not match the renderer, so the grid is effectively in view/camera space instead of world space.
@@ -36,7 +36,7 @@ Together, this suggests the **reconstructed world position from the depth buffer
 2. **Camera-relative XZ** for hex math to avoid precision loss at 2M+ m.
 3. **Two-step unproject:** Separate `inv_projection` (clip → view) and `inv_view` (view → world) with matrices from `view_proj * Projection(cam_transform)` and `cam_transform`.
 4. **Depth source:** Raw vs resolved depth (F6), debug views (F4: quadrants R/G/B/A, power curve for depth).
-5. **Far depth:** Accept depth &gt; 1e-6 so far terrain still gets grid; no change to the “moves with camera” behavior.
+5. **Far depth:** Accept depth &gt; 1e-6 so far terrain still gets grid; no change to the "moves with camera" behavior.
 6. **Borders:** `LINE_WIDTH` reduced from 30 → 12; selection rim from 30 → 18 (× border_scale) for subtler lines.
 
 None of the unproject/matrix changes fixed the panning behavior; the grid still moves with the camera.
@@ -51,12 +51,12 @@ None of the unproject/matrix changes fixed the panning behavior; the grid still 
 - **World hit position** from the physics engine.
 - **Same axial/hex math** (axial round, hex center in world XZ) as the compositor.
 
-So the “infinite, world-locked grid” behavior you want is already achieved for **which hex is under the cursor** and **which hex is selected**. The missing piece is making the **drawn grid** use the same notion of world space.
+So the "infinite, world-locked grid" behavior you want is already achieved for **which hex is under the cursor** and **which hex is selected**. The missing piece is making the **drawn grid** use the same notion of world space.
 
-**Implication:** Consider approaches that do **not** depend on reconstructing world position from the compositor’s depth buffer, for example:
+**Implication:** Consider approaches that do **not** depend on reconstructing world position from the compositor's depth buffer, for example:
 
 - **World-space grid:** Draw the grid in world space (e.g. `HexGridMesh` / decal or a large mesh aligned to world XZ) so it is inherently locked to the terrain, like the raycast. Use the compositor only for hover/selection overlay (which already get correct world positions from the camera).
-- **Or:** If keeping a full screen-space grid, find a way to get **the same depth the main view uses** (correct buffer, correct pass, correct view index) and confirm the compositor’s projection/view matrices match the renderer’s exactly (e.g. same API and frame as the depth write).
+- **Or:** If keeping a full screen-space grid, find a way to get **the same depth the main view uses** (correct buffer, correct pass, correct view index) and confirm the compositor's projection/view matrices match the renderer's exactly (e.g. same API and frame as the depth write).
 
 ---
 
@@ -74,7 +74,7 @@ So the “infinite, world-locked grid” behavior you want is already achieved f
 ## Recommended Next Steps
 
 1. **Validate depth source:** Confirm which buffer the compositor reads (e.g. one-time print of depth RID and pass name) and whether it is the same buffer the opaque scene writes to for the main view.
-2. **Compare with world-space grid:** If `HexGridMesh` (or similar) is used when available, compare behavior: if that grid stays fixed on pan while the compositor grid does not, that supports moving the “infinite grid” drawing to world space and using the compositor mainly for selection/hover.
+2. **Compare with world-space grid:** If `HexGridMesh` (or similar) is used when available, compare behavior: if that grid stays fixed on pan while the compositor grid does not, that supports moving the "infinite grid" drawing to world space and using the compositor mainly for selection/hover.
 3. **Thinner borders:** The reduced `LINE_WIDTH` and rim width are in place; tweak further in `hex_overlay_screen.glsl` if needed.
 
 This summary can be used to hand off the screen-space hex overlay work and to prioritize either fixing depth/unproject in the compositor or shifting the grid to a world-space solution aligned with the selection logic.

@@ -88,7 +88,8 @@ func _ready() -> void:
 				shader_material.set_shader_parameter("overview_origin", overview_origin_vec)
 				shader_material.set_shader_parameter("overview_size", overview_size_vec)
 				shader_material.set_shader_parameter("use_overview", true)
-				print("TerrainLoader: Overview texture loaded (%.0f x %.0f m, grid %dx%d)" % [ow, oh, grid_w, grid_h])
+				if OS.is_debug_build():
+					print("TerrainLoader: Overview texture loaded (%.0f x %.0f m, grid %dx%d)" % [ow, oh, grid_w, grid_h])
 	if overview_size_vec == Vector2.ZERO:
 		shader_material.set_shader_parameter("use_overview", false)
 
@@ -98,7 +99,8 @@ func _ready() -> void:
 	mat_lod2plus.next_pass = null
 	shared_terrain_material_lod2plus = mat_lod2plus
 	add_to_group("terrain_loader")
-	print("TerrainLoader: Unified terrain shader loaded (hex overlay via screen-space compositor).")
+	if OS.is_debug_build():
+		print("TerrainLoader: Unified terrain shader loaded (hex overlay via screen-space compositor).")
 
 
 ## Load a single chunk and return a complete Node3D with mesh and collision
@@ -175,7 +177,7 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 	if collision_shape and collision_body:
 		collision_body.add_child(collision_shape)
 	
-	if DEBUG_CHUNK_TIMING:
+	if DEBUG_CHUNK_TIMING and OS.is_debug_build():
 		var total_ms = Time.get_ticks_msec() - total_t0
 		print("[TIME] PNG read + parse: %dms" % int(_timing_png_read_parse_ms))
 		print("[TIME] Decompression: %dms" % int(_timing_decompress_ms))
@@ -232,10 +234,11 @@ func _load_metadata() -> bool:
 	resolution_m = terrain_metadata.get("resolution_m", 30.0) # Base resolution (LOD 0)
 	chunk_size_px = terrain_metadata.get("chunk_size_px", 512)
 	
-	print("Terrain metadata loaded:")
-	print("  Max elevation: %.1f m" % max_elevation_m)
-	print("  Base resolution (LOD 0): %.1f m/pixel" % resolution_m)
-	print("  Chunk size: %d px" % chunk_size_px)
+	if OS.is_debug_build():
+		print("Terrain metadata loaded:")
+		print("  Max elevation: %.1f m" % max_elevation_m)
+		print("  Base resolution (LOD 0): %.1f m/pixel" % resolution_m)
+		print("  Chunk size: %d px" % chunk_size_px)
 	
 	return true
 
@@ -248,10 +251,10 @@ func _load_16bit_heightmap(path: String) -> Array[float]:
 	"""
 	var heights: Array[float] = []
 	if _height_cache.has(path):
-		if DEBUG_CHUNK_TIMING:
+		if DEBUG_CHUNK_TIMING and OS.is_debug_build():
 			print("[CACHE] Hit: %s (skipped decode)" % path.get_file())
 		return _height_cache[path]
-	if DEBUG_CHUNK_TIMING:
+	if DEBUG_CHUNK_TIMING and OS.is_debug_build():
 		print("[CACHE] Miss: %s" % path.get_file())
 	if not FileAccess.file_exists(path):
 		push_error("Heightmap file not found: " + path)
@@ -516,7 +519,7 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 	var chunk_world_size = chunk_size_px * resolution_m * lod_scale
 	var actual_vertex_spacing = chunk_world_size / float(mesh_res - 1) # -1 because we want edge-to-edge
 	
-	if DEBUG_CHUNK_TIMING and verbose:
+	if DEBUG_CHUNK_TIMING and verbose and OS.is_debug_build():
 		print("Generating mesh: LOD %d, %d×%d vertices, %.1fm spacing..." % [lod, mesh_res, mesh_res, actual_vertex_spacing])
 	
 	var vertices = PackedVector3Array()
@@ -545,7 +548,7 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 			)
 			vertices.append(pos)
 	
-	if DEBUG_CHUNK_TIMING and verbose:
+	if DEBUG_CHUNK_TIMING and verbose and OS.is_debug_build():
 		print("Generated %d vertices" % vertices.size())
 	
 	# Generate indices (two triangles per quad)
@@ -567,7 +570,7 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 			indices.append(bottom_right)
 			indices.append(bottom_left)
 	
-	if DEBUG_CHUNK_TIMING and verbose:
+	if DEBUG_CHUNK_TIMING and verbose and OS.is_debug_build():
 		print("Generated %d triangles" % (indices.size() / 3))
 	
 	_timing_mesh_ms = Time.get_ticks_msec() - t0
@@ -733,7 +736,7 @@ func start_async_load(chunk_x: int, chunk_y: int, lod: int, debug_diagnostic: bo
 	# Use TerrainWorker (static class) so worker never references this node; avoids "previously freed" and editor freeze on stop
 	var callable_task = Callable(_TerrainWorkerScript, "compute_chunk_data").bind(args)
 	var task_id = WorkerThreadPool.add_task(callable_task, false, "chunk_lod%d_%d_%d" % [lod, chunk_x, chunk_y])
-	if DEBUG_CHUNK_TIMING:
+	if DEBUG_CHUNK_TIMING and OS.is_debug_build():
 		print("[ASYNC] Submitted lod%d_x%d_y%d" % [lod, chunk_x, chunk_y])
 	return { "task_id": task_id, "args": args }
 
@@ -945,6 +948,6 @@ func finish_load(computed_data: Dictionary, collision_body: StaticBody3D, debug_
 	if mesh_instance == null:
 		return null
 	finish_load_step_collision(computed_data, collision_body)
-	if DEBUG_CHUNK_TIMING:
+	if DEBUG_CHUNK_TIMING and OS.is_debug_build():
 		print("[ASYNC] Completed lod%d_x%d_y%d (Phase B: full)" % [computed_data["lod"], computed_data["chunk_x"], computed_data["chunk_y"]])
 	return mesh_instance

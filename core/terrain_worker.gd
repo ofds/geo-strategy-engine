@@ -192,7 +192,7 @@ static func compute_chunk_data(args: Dictionary) -> void:
 		args["result"] = {}
 		return
 	# Stage 1: Raw PNG (Alps chunk only, when debug_diagnostic)
-	if do_height_diag and diag_raw.has("raw_min"):
+	if do_height_diag and OS.is_debug_build() and diag_raw.has("raw_min"):
 		var raw_sample_str: String = ""
 		for v in diag_raw.get("raw_sample", []):
 			raw_sample_str += str(v) + ", "
@@ -203,7 +203,7 @@ static func compute_chunk_data(args: Dictionary) -> void:
 	for h in heights:
 		elev_min = minf(elev_min, h)
 		elev_max = maxf(elev_max, h)
-	if do_height_diag:
+	if do_height_diag and OS.is_debug_build():
 		print("[HEIGHT] Elevation meters: min=%.1fm max=%.1fm range=%.1fm" % [elev_min, elev_max, elev_max - elev_min])
 	var lod_scale: int = int(pow(2, lod))
 	var chunk_world_size: float = cpx * res_m * lod_scale
@@ -211,7 +211,7 @@ static func compute_chunk_data(args: Dictionary) -> void:
 	# LOD 4 ultra path disabled: was producing flat green planes; use normal 32x32 mesh instead
 	var mesh_res: int = mesh_resolutions[lod]
 	var sample_stride: int = cpx / mesh_res  # Integer division: pixels per vertex
-	if do_height_diag:
+	if do_height_diag and OS.is_debug_build():
 		print("[DECIMATE] LOD %d step=%d -> %dx%d vertices" % [lod, sample_stride, mesh_res, mesh_res])
 	var actual_vertex_spacing: float = chunk_world_size / float(mesh_res - 1)
 	var vertices = PackedVector3Array()
@@ -228,7 +228,7 @@ static func compute_chunk_data(args: Dictionary) -> void:
 	for i in range(vertices.size()):
 		vy_min = minf(vy_min, vertices[i].y)
 		vy_max = maxf(vy_max, vertices[i].y)
-	if do_height_diag:
+	if do_height_diag and OS.is_debug_build():
 		print("[HEIGHT] Vertex Y: min=%.1f max=%.1f range=%.1f (LOD=%d, vertices=%d)" % [vy_min, vy_max, vy_max - vy_min, lod, vertices.size()])
 	for y in range(mesh_res - 1):
 		for x in range(mesh_res - 1):
@@ -245,7 +245,7 @@ static func compute_chunk_data(args: Dictionary) -> void:
 	var normals = compute_normals_lod_decimated(heights, actual_vertex_spacing, mesh_res, sample_stride, cpx)
 	# Stage 4: Normal sample (center few) and normal variance (expected > 0.1 if not flat)
 	var normal_variance: float = 0.0
-	if do_height_diag and normals.size() > 0:
+	if do_height_diag and OS.is_debug_build() and normals.size() > 0:
 		var mid: int = mesh_res * (mesh_res / 2) + (mesh_res / 2)
 		var n0 = normals[mini(mid, normals.size() - 1)]
 		var n1 = normals[mini(mid + 1, normals.size() - 1)]

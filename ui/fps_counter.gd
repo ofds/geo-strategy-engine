@@ -36,8 +36,9 @@ func _process(delta: float) -> void:
 		_perf_warning_cooldown -= delta
 		if low_1pct < 60.0 and _perf_warning_cooldown <= 0.0:
 			_perf_warning_cooldown = 2.0
-			var phase_b_ms = 0.0
-			if cm and "_last_phase_b_ms" in cm:
-				phase_b_ms = cm._last_phase_b_ms
-			print("[PERF] 1%% low: %d FPS (Phase B: %dms)" % [int(low_1pct), int(phase_b_ms)])
+			if OS.is_debug_build():
+				var phase_b_ms = 0.0
+				if cm and "_last_phase_b_ms" in cm:
+					phase_b_ms = cm._last_phase_b_ms
+				print("[PERF] 1%% low: %d FPS (Phase B: %dms)" % [int(low_1pct), int(phase_b_ms)])
 	text = "FPS: %d (avg: %s, 1%% low: %s)\nDraw Calls: %d" % [fps, avg_fps_str, low_1pct_str, draw_calls]

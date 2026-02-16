@@ -48,7 +48,7 @@ float dist_from_sel_center = max(d1_sel, d2_sel);
 
 - **Number of distance checks:** 2 (`d1_sel`, `d2_sel`).
 - **Format:** `dist_from_sel_center = max(d1_sel, d2_sel)` (no third component).
-- **Note:** This is the standard flat-top hex “distance from center” in the 2D metric; `hex_radius` is half the hex width (`params.hex_size * 0.5`).
+- **Note:** This is the standard flat-top hex "distance from center" in the 2D metric; `hex_radius` is half the hex width (`params.hex_size * 0.5`).
 
 ### GOLDEN BORDER / GLOW CODE
 
@@ -78,10 +78,10 @@ if (is_selected) {
 
 ### NOTES (Step 1)
 
-- Cutout darkens a **larger** region than the hex (hex + 15 m). That can look like dark artifacts “outside” the hex.
-- “Two faces” could relate to the hex distance being from `max(d1_sel, d2_sel)`: the gradient and soft transitions differ along the 6 edges (flat-top: 2 axes dominate).
+- Cutout darkens a **larger** region than the hex (hex + 15 m). That can look like dark artifacts "outside" the hex.
+- "Two faces" could relate to the hex distance being from `max(d1_sel, d2_sel)`: the gradient and soft transitions differ along the 6 edges (flat-top: 2 axes dominate).
 - Breathing is explicitly coded via `rim_pulse` and `params.time`.
-- Nearby non-selected hexes get a separate darken (lines 181–186) within `params.hex_size * 2.0`, which can add to perceived “membrane” or dark halos.
+- Nearby non-selected hexes get a separate darken (lines 181–186) within `params.hex_size * 2.0`, which can add to perceived "membrane" or dark halos.
 
 ---
 
@@ -91,8 +91,8 @@ if (is_selected) {
 
 ### GEOMETRY METHOD
 
-- **Approach:** Rectangular grid clipped to hex. Comment: *“Rectangular grid (snap outer points to hex boundary)”* and *“Build ordered boundary vertices… for walls and rim”*.
-- **Walls explicitly created:** **Yes.** Loop at lines 263–292: *“Side walls: consecutive boundary vertices, quad each (top L/R, bottom L/R)”*. Each boundary segment becomes a quad (top-left, bottom-left, bottom-right, top-right) with `earth` vertex color and outward normals.
+- **Approach:** Rectangular grid clipped to hex. Comment: *"Rectangular grid (snap outer points to hex boundary)"* and *"Build ordered boundary vertices… for walls and rim"*.
+- **Walls explicitly created:** **Yes.** Loop at lines 263–292: *"Side walls: consecutive boundary vertices, quad each (top L/R, bottom L/R)"*. Each boundary segment becomes a quad (top-left, bottom-left, bottom-right, top-right) with `earth` vertex color and outward normals.
 
 ### MATERIAL PROPERTIES
 
@@ -117,7 +117,7 @@ if (is_selected) {
 ### NOTES (Step 2)
 
 - Single material for both top and walls; walls are only differentiated by vertex color (earth).
-- Rim is a line strip (one pixel wide in practice); no separate “thick” rim geometry. Visibility depends on line rendering and possible overlay darkening.
+- Rim is a line strip (one pixel wide in practice); no separate "thick" rim geometry. Visibility depends on line rendering and possible overlay darkening.
 - Slice (and rim) move with `_slice_instance.position.y` (lift + oscillation); they do not set a special render order vs the screen-space overlay.
 
 ---
@@ -185,14 +185,14 @@ Slice node exists: true
 
 ### When a hex is selected, the shader should
 
-1. **Cutout:** Darken the entire region within `hex_radius + 15` m of the selected hex center to near black (0.02) with high alpha (0.95 × tint_fade), so the “hole” is larger than the hex and extends outside it.
+1. **Cutout:** Darken the entire region within `hex_radius + 15` m of the selected hex center to near black (0.02) with high alpha (0.95 × tint_fade), so the "hole" is larger than the hex and extends outside it.
 2. **Border:** Draw a golden outline (0.85, 0.75, 0.35) only for pixels **inside** the hex (`dist_from_sel_center <= hex_radius`), using a smoothstep on `dist_to_sel_edge` (width/smooth scaled by altitude).
 3. **Glow:** Add orange-gold emission (1.0, 0.8, 0.3) with a Gaussian falloff from the hex edge and a time-based pulse (breathing). Also only inside the hex.
 4. **Surrounding:** Slightly darken other hexes within 2× hex_size of the selection center (0.15 alpha blend to black).
 
 ### The physical slice should
 
-1. **Shape:** Lifted hex-shaped “cookie” of terrain: rectangular grid clipped to flat-top hex, with a small vertical offset above terrain to avoid z-fight.
+1. **Shape:** Lifted hex-shaped "cookie" of terrain: rectangular grid clipped to flat-top hex, with a small vertical offset above terrain to avoid z-fight.
 2. **Walls:** Vertical quads along the 6 hex edges, from terrain height (plus offset) down by `WALL_DEPTH_M` (40 m), earth-colored.
 3. **Materials:** One vertex-colored material for top + walls (terrain + earth); emission updated in `_process` for a slight warm lift glow. Rim: separate unshaded golden emissive line strip at the hex boundary.
 
@@ -223,13 +223,13 @@ The file exists and is the one analyzed above.
 
 | Observation | Possible relevance |
 |-------------|--------------------|
-| Cutout is hex_radius **+ 15 m** | Dark band/artifacts **outside** the hex; “membrane” feel. |
+| Cutout is hex_radius **+ 15 m** | Dark band/artifacts **outside** the hex; "membrane" feel. |
 | Golden outline/glow only when **inside** hex | Rim can be hard to see if cutout darkening or alpha dominates. |
-| **rim_pulse** with `params.time * 1.5` | Explains “breathing” animation. |
-| Hex distance = **max(d1_sel, d2_sel)** (2 axes) | Different edge orientations can give asymmetric soft transitions (“two faces” more affected). |
+| **rim_pulse** with `params.time * 1.5` | Explains "breathing" animation. |
+| Hex distance = **max(d1_sel, d2_sel)** (2 axes) | Different edge orientations can give asymmetric soft transitions ("two faces" more affected). |
 | Nearby hex darken (2× hex_size) | Extra darkening around selection can look like halos or membrane. |
 | Rim = line strip, child of slice | Thin; can be lost under strong overlay darkening or depth. |
-| Overlay drawn **after** opaque pass | Cutout and darkening are drawn on top of the physical slice, so slice and walls can look “under a dark layer” rather than a clear lifted piece. |
+| Overlay drawn **after** opaque pass | Cutout and darkening are drawn on top of the physical slice, so slice and walls can look "under a dark layer" rather than a clear lifted piece. |
 
 ---
 

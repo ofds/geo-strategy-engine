@@ -1,6 +1,26 @@
 # GeoStrategy Engine - Progress Tracker
 
-**Last Updated:** February 15, 2026
+**Last Updated:** February 16, 2026
+
+## Session February 16, 2026 — Codebase Cleanup
+
+**What was done:**
+- Deleted dead files: `rendering/hex_grid_OLD.gdshader`, `node_3d.tscn` (root; no references, main scene is terrain_demo.tscn)
+- Removed/gated 40+ debug print statements: removed slice diagnostic block in `hex_selector.gd`; gated init/state/diagnostic prints in `basic_camera.gd`, `chunk_manager.gd`, `hex_overlay_compositor.gd`, `terrain_loader.gd`, `terrain_worker.gd`, `fps_counter.gd` with `OS.is_debug_build()` or existing DEBUG_* flags
+- Consolidated duplicated constants: `INNER_RADIUS_M`, `VISIBLE_RADIUS_ALTITUDE_FACTOR` in `chunk_manager.gd` now reference `_Const` (config/constants.gd); `LOD_DISTANCES_M` was already from Constants
+- Fixed loading screen empty chunk name: ChunkManager now passes last completed chunk key or first pending Phase B chunk key (fallback "..." when none)
+- Documented `_verify_no_overlaps` in chunk_manager as debug utility (call manually); added TODO in basic_camera for getting terrain material from TerrainLoader directly
+- Archived findings docs to `docs/archive/`: HEX_OVERLAY_FINAL_SUMMARY.md, HEX_GRID_DECAL_FINDINGS.md, HEX_SELECTION_DIAGNOSTIC_REPORT.md
+- CODEBASE_AUDIT.md was already present (comprehensive project audit)
+
+**Current state:**
+- Codebase is clean, no dead code or ungated debug noise
+- All LOD/radius constants have single source of truth in `config/constants.gd`
+- Documentation consolidated: PROGRESS.md (living), CODEBASE_AUDIT.md (reference), GeoStrategy_Engine_SSOT.md (design), archive/ (historical findings)
+
+**Next:** Phase 2 — Terrain shader precision fix (camera-relative coordinates)
+
+---
 
 ## 📂 Project Structure & Key Files
 

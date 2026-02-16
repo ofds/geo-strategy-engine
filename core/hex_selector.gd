@@ -397,23 +397,6 @@ func set_selected_hex(center_xz: Vector2) -> void:
 	# 	rim_instance.mesh = rim_mesh
 	# 	_slice_instance.add_child(rim_instance)
 
-	# --- DIAGNOSTIC (remove after debugging) ---
-	var hex_center := Vector2(_center_x, _center_z)
-	var vert_count := 0
-	if _slice_mesh and _slice_mesh.get_surface_count() > 0:
-		var arrs = _slice_mesh.surface_get_arrays(0)
-		var verts = arrs[Mesh.ARRAY_VERTEX] if arrs.size() > Mesh.ARRAY_VERTEX else null
-		vert_count = verts.size() if verts else 0
-	print("=== SLICE DIAGNOSTIC ===")
-	print("Hex center: ", hex_center)
-	print("Vertices generated: ", vert_count)
-	print("Slice node exists: ", _slice_instance != null)
-	if _slice_instance:
-		print("  Visible: ", _slice_instance.visible)
-		print("  Position: ", _slice_instance.position)
-		print("  Children: ", _slice_instance.get_child_count())
-	print("========================")
-
 
 func clear_selection() -> void:
 	if _slice_instance:

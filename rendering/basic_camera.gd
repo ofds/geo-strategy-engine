@@ -112,10 +112,11 @@ func _ready() -> void:
 	
 	_update_camera_transform()
 	
-	print("\n=== Camera initialized for multi-LOD view ===")
-	print("Target: %s" % target_position)
-	print("Distance: %.1f m (%.1f km)" % [orbit_distance, orbit_distance / 1000.0])
-	print("Camera far plane: %.1f km" % (far / 1000.0))
+	if OS.is_debug_build():
+		print("\n=== Camera initialized for multi-LOD view ===")
+		print("Target: %s" % target_position)
+		print("Distance: %.1f m (%.1f km)" % [orbit_distance, orbit_distance / 1000.0])
+		print("Camera far plane: %.1f km" % (far / 1000.0))
 
 
 func _input(event: InputEvent) -> void:
@@ -136,8 +137,6 @@ func _input(event: InputEvent) -> void:
 			
 		# Mouse Click - Hex Selection
 		elif event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
-			if DEBUG_DIAGNOSTIC:
-				print("DEBUG: Left Click Detected at ", event.position)
 			_handle_hex_selection_click(event.position)
 	
 	# Mouse motion - orbit when middle button held
@@ -254,8 +253,6 @@ func _update_hex_selection_uniform() -> void:
 	if _hex_compositor:
 		_hex_compositor.selected_hex_center = _selected_hex_center
 		_hex_compositor.selection_time = _selection_time
-	elif DEBUG_DIAGNOSTIC:
-		print("DEBUG: Hex overlay compositor not found to update selection!")
 
 
 func _process(delta: float) -> void:
@@ -272,12 +269,11 @@ func _process(delta: float) -> void:
 			_zoom_in_label.visible = false
 	
 	# Stage 5 diagnostic: altitude and overview_blend once per second (DEBUG_DIAGNOSTIC)
-	if DEBUG_DIAGNOSTIC:
+	if DEBUG_DIAGNOSTIC and OS.is_debug_build():
 		_shader_diag_timer += delta
 		if _shader_diag_timer >= 1.0:
 			_shader_diag_timer = 0.0
 			var alt: float = orbit_distance if orbit_distance > 0.0 else position.y
-			# Same formula as shader: smoothstep(15000.0, 180000.0, altitude)
 			var t: float = clampf((alt - 15000.0) / (180000.0 - 15000.0), 0.0, 1.0)
 			var overview_blend: float = t * t * (3.0 - 2.0 * t)
 			print("[SHADER] altitude=%.1f overview_blend=%.3f" % [alt, overview_blend])
@@ -392,8 +388,8 @@ func _update_camera_transform() -> void:
 	query.collision_mask = 1 # Only check layer 1 (terrain)
 	var result = space_state.intersect_ray(query)
 	
-	# Debug output (every 30 frames to reduce spam)
-	if debug_collision:
+	# Debug output (every 30 frames to reduce spam; only in debug builds)
+	if debug_collision and OS.is_debug_build():
 		frame_count += 1
 		if frame_count % 30 == 0:
 			if result:
@@ -424,6 +420,7 @@ func _update_camera_transform() -> void:
 	_update_hex_grid_interaction()
 
 
+# TODO: Get material reference from TerrainLoader directly instead of from first chunk node
 func _get_terrain_material() -> ShaderMaterial:
 	var chunk = get_tree().get_first_node_in_group("terrain_chunks")
 	if chunk and chunk is MeshInstance3D:
@@ -478,7 +475,7 @@ func _update_hex_grid_interaction() -> void:
 		if single:
 			terrain_materials.append(single)
 
-	if DEBUG_DIAGNOSTIC and not _hex_diag_printed and _hex_compositor:
+	if DEBUG_DIAGNOSTIC and OS.is_debug_build() and not _hex_diag_printed and _hex_compositor:
 		_hex_diag_printed = true
 		print("[HEX] Frame update: altitude=%.1f show_grid=%s (compositor)" % [alt_uniform, _hex_compositor.show_grid])
 
@@ -507,7 +504,8 @@ func _update_hex_grid_interaction() -> void:
 				terrain_material.set_shader_parameter("show_hex_grid", _grid_visible)
 			if _hex_compositor:
 				_hex_compositor.show_grid = _grid_visible
-			print("[Camera] Hex grid: ", "ON" if _grid_visible else "OFF")
+			if OS.is_debug_build():
+				print("[Camera] Hex grid: ", "ON" if _grid_visible else "OFF")
 			_f1_pressed_last_frame = true
 	else:
 		_f1_pressed_last_frame = false
@@ -564,8 +562,9 @@ func _update_hex_grid_interaction() -> void:
 				var d = _hex_compositor.debug_visualization
 				d = 0.0 if d >= 2.0 else (1.0 if d < 0.5 else 2.0)
 				_hex_compositor.debug_visualization = d
-				var msg = "Hex debug: off" if d < 0.5 else ("depth" if d < 1.5 else "world XZ pattern")
-				print("[HEX DEBUG] %s (F2 to cycle)" % msg)
+				if OS.is_debug_build():
+					var msg = "Hex debug: off" if d < 0.5 else ("depth" if d < 1.5 else "world XZ pattern")
+					print("[HEX DEBUG] %s (F2 to cycle)" % msg)
 				_f2_pressed_last_frame = true
 		else:
 			_f2_pressed_last_frame = false
@@ -574,7 +573,8 @@ func _update_hex_grid_interaction() -> void:
 		if Input.is_key_pressed(KEY_F3):
 			if not _f3_pressed_last_frame and _hex_compositor:
 				_hex_compositor.depth_ndc_flip = not _hex_compositor.depth_ndc_flip
-				print("[HEX DEBUG] depth_ndc_flip = %s (F3 to toggle)" % _hex_compositor.depth_ndc_flip)
+				if OS.is_debug_build():
+					print("[HEX DEBUG] depth_ndc_flip = %s (F3 to toggle)" % _hex_compositor.depth_ndc_flip)
 				_f3_pressed_last_frame = true
 		else:
 			_f3_pressed_last_frame = false
@@ -583,8 +583,9 @@ func _update_hex_grid_interaction() -> void:
 		if Input.is_key_pressed(KEY_F4):
 			if not _f4_pressed_last_frame and _hex_compositor:
 				_hex_compositor.debug_depth = not _hex_compositor.debug_depth
-				var on_off = "ON (4 quadrants = R,G,B,A)" if _hex_compositor.debug_depth else "OFF"
-				print("[HEX DEBUG] Debug Depth %s (F4=toggle view, F6=toggle depth source)" % on_off)
+				if OS.is_debug_build():
+					var on_off = "ON (4 quadrants = R,G,B,A)" if _hex_compositor.debug_depth else "OFF"
+					print("[HEX DEBUG] Debug Depth %s (F4=toggle view, F6=toggle depth source)" % on_off)
 				_f4_pressed_last_frame = true
 		else:
 			_f4_pressed_last_frame = false
@@ -593,8 +594,9 @@ func _update_hex_grid_interaction() -> void:
 		if Input.is_key_pressed(KEY_F6):
 			if not _f6_pressed_last_frame and _hex_compositor:
 				_hex_compositor.use_resolved_depth = not _hex_compositor.use_resolved_depth
-				var src = "RESOLVED" if _hex_compositor.use_resolved_depth else "RAW"
-				print("[HEX DEBUG] depth source = %s (F6 to toggle; with F4 on, border is yellow=resolved, magenta=raw)" % src)
+				if OS.is_debug_build():
+					var src = "RESOLVED" if _hex_compositor.use_resolved_depth else "RAW"
+					print("[HEX DEBUG] depth source = %s (F6 to toggle; with F4 on, border is yellow=resolved, magenta=raw)" % src)
 				_f6_pressed_last_frame = true
 		else:
 			_f6_pressed_last_frame = false
