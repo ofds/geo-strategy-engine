@@ -567,6 +567,10 @@ func _do_one_phase_b_step() -> void:
 		if mesh != null:
 			var mesh_instance = terrain_loader.finish_load_step_scene(computed, mesh, false)
 			if mesh_instance:
+				var override_mat = mesh_instance.get_surface_override_material(0)
+				print("[MAT-TRACE] Chunk material shader: ", override_mat.shader.resource_path if override_mat is ShaderMaterial and override_mat and override_mat.shader else "NOT ShaderMaterial or no override")
+				print("[MAT-TRACE] Chunk material ID: ", override_mat.get_instance_id() if override_mat else "NO OVERRIDE")
+				print("[MAT-TRACE] Chunk surface material: ", mesh_instance.mesh.surface_get_material(0) if mesh_instance.mesh and mesh_instance.mesh.get_surface_count() > 0 else "NO SURFACE MATERIAL")
 				mesh_instance.add_to_group("terrain_chunks") # So camera finds shared material without recursive search
 				mesh_instance.scale = Vector3(0.97, 0.97, 0.97)
 				chunks_container.add_child(mesh_instance)

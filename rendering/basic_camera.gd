@@ -475,11 +475,22 @@ func _update_hex_grid_interaction() -> void:
 		if single:
 			terrain_materials.append(single)
 
+	if terrain_materials.size() > 0 and not _hex_trace_material_logged:
+		_hex_trace_material_logged = true
+		var tm = terrain_materials[0]
+		print("[HEX-TRACE] Camera terrain_material: ", tm, " shader: ", tm.shader.resource_path if tm is ShaderMaterial and tm.shader else "NONE")
+
 	if DEBUG_DIAGNOSTIC and OS.is_debug_build() and not _hex_diag_printed and _hex_compositor:
 		_hex_diag_printed = true
 		print("[HEX] Frame update: altitude=%.1f show_grid=%s (compositor)" % [alt_uniform, _hex_compositor.show_grid])
 
+	var _now_msec = Time.get_ticks_msec()
+	var _log_hex_set = (_now_msec - _hex_trace_last_set_msec >= 1000)
+	if _log_hex_set:
+		_hex_trace_last_set_msec = _now_msec
 	for terrain_material in terrain_materials:
+		if _log_hex_set:
+			print("[HEX-TRACE] Setting show_hex_grid = ", _grid_visible, " on material ID: ", terrain_material.get_instance_id() if terrain_material else 0)
 		terrain_material.set_shader_parameter("altitude", alt_uniform)
 		terrain_material.set_shader_parameter("camera_position", position)
 		terrain_material.set_shader_parameter("terrain_center_xz", _terrain_center_xz)
@@ -500,6 +511,7 @@ func _update_hex_grid_interaction() -> void:
 	if Input.is_key_pressed(KEY_F1):
 		if not _f1_pressed_last_frame:
 			_grid_visible = not _grid_visible
+			print("[HEX-TRACE] F1 pressed. _grid_visible is now: ", _grid_visible)
 			for terrain_material in terrain_materials:
 				terrain_material.set_shader_parameter("show_hex_grid", _grid_visible)
 			if _hex_compositor:
@@ -611,6 +623,8 @@ var _f6_pressed_last_frame: bool = false
 var _debug_label: Label = null
 var _selection_label: Label = null
 var _hex_diag_printed: bool = false
+var _hex_trace_material_logged: bool = false
+var _hex_trace_last_set_msec: int = 0
 
 
 func _find_chunk_recursive(node: Node) -> MeshInstance3D:

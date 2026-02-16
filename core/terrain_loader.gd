@@ -94,10 +94,13 @@ func _ready() -> void:
 		shader_material.set_shader_parameter("use_overview", false)
 
 	shared_terrain_material = shader_material
+	print("[MAT-TRACE] shared_terrain_material shader path: ", shared_terrain_material.shader.resource_path if shared_terrain_material.shader else "NO SHADER")
+	print("[MAT-TRACE] shared_terrain_material instance ID: ", shared_terrain_material.get_instance_id())
 	# LOD 2+ material: same terrain, no next_pass (hex overlay is screen-space compositor for all LODs).
 	var mat_lod2plus: ShaderMaterial = shader_material.duplicate(true) as ShaderMaterial
 	mat_lod2plus.next_pass = null
 	shared_terrain_material_lod2plus = mat_lod2plus
+	print("[MAT-TRACE] shared_terrain_material_lod2plus shader: ", shared_terrain_material_lod2plus.shader.resource_path if shared_terrain_material_lod2plus and shared_terrain_material_lod2plus is ShaderMaterial and shared_terrain_material_lod2plus.shader else "NONE")
 	add_to_group("terrain_loader")
 	if OS.is_debug_build():
 		print("TerrainLoader: Unified terrain shader loaded (hex overlay via screen-space compositor).")
@@ -904,6 +907,10 @@ func finish_load_step_scene(computed_data: Dictionary, mesh: ArrayMesh, debug_co
 			mesh_instance.set_surface_override_material(0, shared_terrain_material)
 		else:
 			mesh_instance.set_surface_override_material(0, shared_terrain_material_lod2plus)
+	var surf_mat = mesh_instance.get_surface_override_material(0)
+	print("[MAT-TRACE] Chunk material shader: ", surf_mat.shader.resource_path if surf_mat is ShaderMaterial and surf_mat.shader else "NOT ShaderMaterial or no override")
+	print("[MAT-TRACE] Chunk material ID: ", surf_mat.get_instance_id() if surf_mat else "NO OVERRIDE")
+	print("[MAT-TRACE] Chunk surface material: ", mesh_instance.mesh.surface_get_material(0) if mesh_instance.mesh and mesh_instance.mesh.get_surface_count() > 0 else "NO SURFACE MATERIAL")
 	mesh_instance.position = world_pos
 	return mesh_instance
 

@@ -21,10 +21,10 @@ uniform bool use_overview = false;
 
 // Hex grid: same lens as selection (basic_camera.gd). hex_size = pointy-top radius = HEX_SIZE_M/sqrt(3).
 uniform float hex_size = 577.35;
-uniform float hex_line_width = 22.0;
+uniform float hex_line_width = 30.0;
 uniform float hex_line_softness = 5.0;
-uniform float hex_grid_strength = 0.55;
-uniform vec3 hex_line_color = vec3(0.10, 0.12, 0.08);
+uniform float hex_grid_strength = 10;
+uniform vec3 hex_line_color = vec3(0.07, 0.09, 0.05);
 uniform bool show_hex_grid = true;
 
 varying vec3 v_world_pos;
@@ -105,8 +105,8 @@ vec2 hex_edge_and_inside(vec2 world_xz, float size) {
 	vec2 p = world_xz - center;
 	float k = size;
 	float c = 0.866025, s = 0.5;
-	vec2 v0 = k * vec2(0.0, 1.0), v1 = k * vec2(c, s), v2 = k * vec2(c, -s);
-	vec2 v3 = k * vec2(0.0, -1.0), v4 = k * vec2(-c, -s), v5 = k * vec2(-c, s);
+	vec2 v0 = k * vec2(0.0, 1.0), v1 = k * vec2(-c, s), v2 = k * vec2(-c, -s);
+	vec2 v3 = k * vec2(0.0, -1.0), v4 = k * vec2(c, -s), v5 = k * vec2(c, s);
 	float d0 = seg_dist(p, v0, v1), d1 = seg_dist(p, v1, v2), d2 = seg_dist(p, v2, v3);
 	float d3 = seg_dist(p, v3, v4), d4 = seg_dist(p, v4, v5), d5 = seg_dist(p, v5, v0);
 	float edge_d = min(min(min(d0, d1), min(d2, d3)), min(d4, d5));
@@ -170,22 +170,47 @@ void fragment() {
 	float fog_factor = smoothstep(fog_start, fog_end_actual, dist);
 	base_col = mix(base_col, fog_color, fog_factor);
 
-	// Hex grid: same cells as selection; draw band at edges, only inside cell (no gap triangles)
+	// TEMP: Unconditional red tint to verify this shader is on the visible terrain
+	base_col = mix(base_col, vec3(1.0, 0.0, 0.0), 0.3);
+
+	// === HEX GRID DIAGNOSTIC — TEMPORARY ===
 	float hex_line_mask = 0.0;
+	float grid_mix = 0.0;
+	int hex_test = 1; // <-- CHANGE THIS NUMBER TO RUN DIFFERENT TESTS
+
 	if (show_hex_grid) {
 		vec2 edge_inside = hex_edge_and_inside(v_world_pos.xz, hex_size);
 		float d = edge_inside.x;
 		float inside = edge_inside.y;
 		float aa = fwidth(d) * hex_line_softness;
-		hex_line_mask = (1.0 - smoothstep(hex_line_width - aa, hex_line_width + aa, d)) * inside;
-		hex_line_mask *= smoothstep(0.35, 0.65, dot(n, vec3(0.0, 1.0, 0.0)));
-		base_col = mix(base_col, base_col * 0.55, hex_line_mask * hex_grid_strength);
-		base_col = mix(base_col, hex_line_color, hex_line_mask * hex_grid_strength * 0.7);
+
+		if (hex_test == 1) {
+			// TEST 1: Inside mask — red where inside==1, normal terrain where inside==0
+			if (inside > 0.5) {
+				base_col = vec3(1.0, 0.0, 0.0);
+			}
+		} else if (hex_test == 2) {
+			// TEST 2: Edge distance gradient — bright near edges, dark at cell centers
+			float d_viz = 1.0 - clamp(d / (hex_size * 0.5), 0.0, 1.0);
+			base_col = vec3(d_viz);
+		} else if (hex_test == 3) {
+			// TEST 3: Line mask — white lines where the smoothstep produces nonzero
+			hex_line_mask = (1.0 - smoothstep(hex_line_width - aa, hex_line_width + aa, d)) * inside;
+			base_col = vec3(hex_line_mask);
+		} else if (hex_test == 4) {
+			// TEST 4: fwidth — bright means fwidth(d) is large (bad), dark means small (good)
+			float fw = fwidth(d);
+			base_col = vec3(clamp(fw / 100.0, 0.0, 1.0));
+		} else if (hex_test == 5) {
+			// TEST 5: hex_size value — should be ~0.577 red if hex_size is correct (577.35/1000)
+			base_col = vec3(clamp(hex_size / 1000.0, 0.0, 1.0), 0.0, 0.0);
+		}
 	}
+	// === END DIAGNOSTIC ===
 
 	ALBEDO = min(base_col, vec3(1.5));
 	EMISSION = vec3(0.0);
-	ROUGHNESS = clamp(roughness + hex_line_mask * hex_grid_strength * 0.3, 0.0, 1.0);
+	ROUGHNESS = clamp(roughness + grid_mix * 0.3, 0.0, 1.0);
 	METALLIC = metallic;
 	RIM = rim;
 	RIM_TINT = rim_tint;
