@@ -12,6 +12,10 @@ var chunks_container: Node3D = null
 var collision_body: StaticBody3D = null
 var loading_screen = null
 
+# Phase 1C: Cell metadata for texture-based selection. Key = cell_id (int), Value = { center_x, center_z, axial_q, axial_r, neighbors }.
+# Loaded once at startup from cell_metadata.json. Empty if file missing or too large.
+var cell_metadata: Dictionary = {}
+
 # Loaded chunks: Key = "lod{L}_x{X}_y{Y}", Value = {node: Node3D, lod: int, x: int, y: int}
 var loaded_chunks: Dictionary = {}
 
@@ -98,7 +102,7 @@ var _last_update_camera_pos: Vector3 = Vector3.ZERO
 var _pending_unload_keys: Array = []
 # Debug D key: only dump once per press (not every frame while held)
 var _debug_d_was_pressed: bool = false
-# Last chunk key that completed Phase B (for loading screen label — Fix 3)
+# Last chunk key that completed Phase B (for loading screen label - Fix 3)
 var _last_phase_b_completed_chunk_key: String = ""
 
 
@@ -114,11 +118,14 @@ func _ready() -> void:
 	_resolution_m = terrain_loader.resolution_m
 	var mw = terrain_loader.terrain_metadata.get("master_heightmap_width", 16384)
 	var mh = terrain_loader.terrain_metadata.get("master_heightmap_height", 9216)
-	_lod0_grid = Vector2i((mw + 511) / 512, (mh + 511) / 512)
+	_lod0_grid = Vector2i((mw + Constants.CHUNK_SIZE_PX - 1) / Constants.CHUNK_SIZE_PX, (mh + Constants.CHUNK_SIZE_PX - 1) / Constants.CHUNK_SIZE_PX)
 	if OS.is_debug_build():
 		print("ChunkManager: LOD0 grid %d×%d, resolution %.1f m/px" % [_lod0_grid.x, _lod0_grid.y, _resolution_m])
 	
-	# Continental overview plane (instant, gap-free at high zoom) — add first so chunks render on top
+	# Phase 1C: Load cell metadata once for texture-based selection (cell_id -> center, axial, neighbors).
+	_load_cell_metadata()
+	
+	# Continental overview plane (instant, gap-free at high zoom) - add first so chunks render on top
 	_setup_overview_plane()
 	
 	chunks_container = Node3D.new()
@@ -151,6 +158,64 @@ func _ready() -> void:
 	# initial_load_complete set in _process when initial_desired is fully loaded
 
 
+func _load_cell_metadata() -> void:
+	"""Load cell_metadata.json (Phase 1C). Builds cell_metadata dict keyed by cell_id (int) for O(1) lookup.
+	Format from generate_cell_textures.py: cells = { "1": { axial_q, axial_r, center_x, center_z, neighbors }, ... }.
+	Skips load if file missing or larger than CELL_METADATA_MAX_SIZE_BYTES to avoid OOM on huge regions."""
+	const CELL_METADATA_MAX_SIZE_BYTES: int = 400_000_000  # 400 MB - skip if larger (e.g. Europe 8GB)
+	const CELL_METADATA_PATH_LOCAL: String = "res://data/terrain/cell_metadata.json"
+	var path: String = CELL_METADATA_PATH_LOCAL
+	if not FileAccess.file_exists(path):
+		if OS.is_debug_build():
+			push_warning("ChunkManager: Cell metadata not found: " + path + " - selection will use fallback.")
+		return
+	var f: FileAccess = FileAccess.open(path, FileAccess.READ)
+	if not f:
+		push_warning("ChunkManager: Could not open cell metadata: " + path)
+		return
+	var file_len: int = f.get_length()
+	f.close()
+	if file_len > CELL_METADATA_MAX_SIZE_BYTES:
+		push_warning("ChunkManager: Cell metadata too large (%d MB). Skipping load; use smaller region or binary format. Selection may use fallback." % [int(file_len / 1_000_000.0)])
+		return
+	var t0: int = Time.get_ticks_msec()
+	f = FileAccess.open(path, FileAccess.READ)
+	if not f:
+		return
+	var json_text: String = f.get_as_text()
+	f.close()
+	var json = JSON.new()
+	if json.parse(json_text) != OK:
+		push_warning("ChunkManager: Invalid JSON in cell metadata: " + path)
+		return
+	var data = json.data
+	if not data is Dictionary:
+		push_warning("ChunkManager: Cell metadata root is not a Dictionary.")
+		return
+	var cells_obj = data.get("cells", {})
+	if not cells_obj is Dictionary:
+		push_warning("ChunkManager: Cell metadata 'cells' is not an object.")
+		return
+	cell_metadata.clear()
+	for key in cells_obj.keys():
+		var cell_id: int = int(key)
+		if cell_id <= 0:
+			continue
+		var entry = cells_obj[key]
+		if not entry is Dictionary:
+			continue
+		cell_metadata[cell_id] = {
+			"center_x": entry.get("center_x", 0.0),
+			"center_z": entry.get("center_z", 0.0),
+			"axial_q": entry.get("axial_q", 0),
+			"axial_r": entry.get("axial_r", 0),
+			"neighbors": entry.get("neighbors", []),
+		}
+	var elapsed_ms: int = Time.get_ticks_msec() - t0
+	if OS.is_debug_build():
+		print("ChunkManager: Cell metadata loaded %d cells in %d ms" % [cell_metadata.size(), elapsed_ms])
+
+
 func _setup_overview_plane() -> void:
 	"""If metadata has overview_texture, add a flat quad at Y=-20 aligned with chunk grid: world (0,0) = NW corner.
 	Use chunk grid extent (same as chunk positions) so overview and terrain cannot be out of sync."""
@@ -165,8 +230,8 @@ func _setup_overview_plane() -> void:
 	if not tex:
 		push_warning("ChunkManager: Overview texture not found or not imported: " + tex_path)
 		return
-	# Use same extent as chunk grid (LOD0 grid × 512 × resolution) so macro view aligns with chunks
-	const CHUNK_PX: int = 512
+	# Use same extent as chunk grid (LOD0 grid × CHUNK_SIZE_PX × resolution) so macro view aligns with chunks
+	var CHUNK_PX: int = Constants.CHUNK_SIZE_PX
 	var overview_w: float = float(_lod0_grid.x * CHUNK_PX) * _resolution_m
 	var overview_h: float = float(_lod0_grid.y * CHUNK_PX) * _resolution_m
 	if overview_w <= 0.0 or overview_h <= 0.0:
@@ -980,9 +1045,9 @@ func _determine_desired_chunks(camera_pos: Vector3) -> Dictionary:
 
 
 func _determine_inner_chunks(camera_pos: Vector3, altitude: float) -> Dictionary:
-	"""Inner ring: LOD 0 cells within _Const.INNER_RADIUS_M (500km). Same logic as before — up to ~529 cells."""
+	"""Inner ring: LOD 0 cells within _Const.INNER_RADIUS_M (500km). Same logic as before - up to ~529 cells."""
 	var lod0_grid = _lod0_grid
-	var cell_size_m: float = 512.0 * _resolution_m
+	var cell_size_m: float = float(Constants.CHUNK_SIZE_PX) * _resolution_m
 	var cells_radius: int = int(ceil(_Const.INNER_RADIUS_M / cell_size_m))
 
 	var camera_cell_x: int = int(camera_pos.x / cell_size_m)
@@ -1133,14 +1198,14 @@ func _verify_full_coverage_box(chunks: Dictionary, min_cx: int, max_cx: int, min
 		push_error("CRITICAL: %d box cells have no coverage: %s" % [uncovered_cells.size(), ", ".join(uncovered_cells.slice(0, 10))])
 
 
-## Debug utility — call manually to verify chunk overlap state. Not used in normal flow.
+## Debug utility - call manually to verify chunk overlap state. Not used in normal flow.
 func _verify_no_overlaps(chunks: Dictionary) -> void:
 	"""Verify that no two chunks in the set have overlapping world-space bounds."""
 	var chunk_list: Array = []
 	for key in chunks.keys():
 		var info = chunks[key]
 		var lod_scale = int(pow(2, info.lod))
-		var chunk_world_size = 512.0 * _resolution_m * float(lod_scale)
+		var chunk_world_size = float(Constants.CHUNK_SIZE_PX) * _resolution_m * float(lod_scale)
 		var bounds = {
 			"key": key,
 			"lod": info.lod,
@@ -1180,7 +1245,7 @@ func _select_lod_with_hysteresis(lod0_key: String, dist: float, altitude: float 
 		base_lod = 2
 	elif dist < _Const.LOD_DISTANCES_M[4]:
 		base_lod = 3
-	# At high altitude never use LOD 0 — avoids load-then-unload flash and keeps view consistent with overview
+	# At high altitude never use LOD 0 - avoids load-then-unload flash and keeps view consistent with overview
 	const ALTITUDE_LOD0_MAX_M: float = 70000.0
 	if altitude > ALTITUDE_LOD0_MAX_M and base_lod == 0:
 		base_lod = 1
@@ -1188,8 +1253,8 @@ func _select_lod_with_hysteresis(lod0_key: String, dist: float, altitude: float 
 	if lod_hysteresis_state.has(lod0_key):
 		var current_lod = lod_hysteresis_state[lod0_key]
 		
-		# CRITICAL FIX: Hysteresis should ONLY prevent DOWNGRADING (fine → coarse)
-		# It should NEVER prevent UPGRADING (coarse → fine)
+		# CRITICAL FIX: Hysteresis should ONLY prevent DOWNGRADING (fine -> coarse)
+		# It should NEVER prevent UPGRADING (coarse -> fine)
 		# When camera moves closer, always upgrade immediately
 		if base_lod < current_lod:
 			# Camera moved closer - upgrade to finer LOD immediately (NO hysteresis)
@@ -1271,7 +1336,7 @@ func _get_max_concurrent_loads() -> int:
 ## Used by selection to do hex math in chunk-local space (same as terrain shader). Single source of truth.
 func get_chunk_origin_at(world_x: float, world_z: float) -> Vector2:
 	var lod: int = get_lod_at_world_position(Vector3(world_x, 0.0, world_z))
-	var cell_size: float = 512.0 * _resolution_m
+	var cell_size: float = float(Constants.CHUNK_SIZE_PX) * _resolution_m
 	if lod < 0:
 		# Not in any loaded chunk (e.g. overview plane); use LOD 0 cell so hex math still works
 		return Vector2(floor(world_x / cell_size) * cell_size, floor(world_z / cell_size) * cell_size)
@@ -1284,7 +1349,7 @@ func get_chunk_origin_at(world_x: float, world_z: float) -> Vector2:
 ## Returns the LOD of the chunk that contains the given world position (XZ).
 ## Used to disable hex selection on LOD 3+ terrain. Returns -1 if no loaded chunk contains the point.
 func get_lod_at_world_position(world_pos: Vector3) -> int:
-	var cell_size_m: float = 512.0 * _resolution_m
+	var cell_size_m: float = float(Constants.CHUNK_SIZE_PX) * _resolution_m
 	var best_lod: int = -1
 	for key in loaded_chunks.keys():
 		var info = loaded_chunks[key]
@@ -1300,6 +1365,118 @@ func get_lod_at_world_position(world_pos: Vector3) -> int:
 	return best_lod
 
 
+## Phase 1C: Mesh extent for a given LOD (matches terrain mesh UV 0..1 span). Same as TerrainLoader: (mesh_res-1)*vertex_spacing.
+func _get_mesh_extent_for_lod(lod: int) -> float:
+	var mesh_res: int = Constants.CHUNK_SIZE_PX >> lod
+	if mesh_res < 2:
+		mesh_res = 2
+	var vertex_spacing: float = _resolution_m * float(1 << lod)
+	return float(mesh_res - 1) * vertex_spacing
+
+
+## Phase 1C: Texture-based cell query. Uses hit chunk's LOD so selection matches visible grid.
+## lod_hint: use this LOD when >= 0; when -1, use get_lod_at_world_position(world_pos). Returns 0 if no chunk or no texture.
+func get_cell_id_at_position(world_pos: Vector3, lod_hint: int = -1) -> int:
+	var hit_lod: int = lod_hint if lod_hint >= 0 else get_lod_at_world_position(world_pos)
+	if hit_lod < 0 or hit_lod > Constants.HEX_SELECTION_MAX_LOD:
+		return 0
+	var chunk_size: float = _get_chunk_world_size(hit_lod)
+	var cx: int = int(floor(world_pos.x / chunk_size))
+	var cy: int = int(floor(world_pos.z / chunk_size))
+	return _get_cell_id_at_chunk_impl(world_pos, cx, cy, hit_lod)
+
+
+## Phase 1C: Sample cell ID using the exact chunk that was hit (from raycast shape name).
+## Ensures selection reads the same texture as the mesh under the cursor, fixing LOD/origin mismatch.
+func get_cell_id_at_chunk(world_pos: Vector3, chunk_x: int, chunk_y: int, lod: int) -> int:
+	if lod < 0 or lod > Constants.HEX_SELECTION_MAX_LOD:
+		return 0
+	return _get_cell_id_at_chunk_impl(world_pos, chunk_x, chunk_y, lod)
+
+
+func _get_cell_id_at_chunk_impl(world_pos: Vector3, cx: int, cy: int, hit_lod: int) -> int:
+	var chunk_size: float = _get_chunk_world_size(hit_lod)
+	var grid_lod_x: int = (_lod0_grid.x + (1 << hit_lod) - 1) >> hit_lod
+	var grid_lod_y: int = (_lod0_grid.y + (1 << hit_lod) - 1) >> hit_lod
+	if cx < 0 or cy < 0 or cx >= grid_lod_x or cy >= grid_lod_y:
+		return 0
+	if not terrain_loader or not terrain_loader.has_method("get_cell_texture_for_selection"):
+		return 0
+	var tex: Texture2D = terrain_loader.get_cell_texture_for_selection(cx, cy, hit_lod)
+	if tex == null:
+		return 0
+	var chunk_origin_x: float = float(cx) * chunk_size
+	var chunk_origin_z: float = float(cy) * chunk_size
+	var local_x: float = world_pos.x - chunk_origin_x
+	var local_z: float = world_pos.z - chunk_origin_z
+	# Use chunk_size so texture sampling matches terrain mesh UV: mesh UV 0..1 = 0..chunk_world_size.
+	var img: Image = tex.get_image()
+	if img == null or img.is_empty():
+		return 0
+	var w: int = img.get_width()
+	var h: int = img.get_height()
+	var px: int = clampi(int(round(local_x / chunk_size * float(w))), 0, w - 1)
+	var py: int = clampi(int(round(local_z / chunk_size * float(h))), 0, h - 1)
+	var color: Color = img.get_pixel(px, py)
+	return _decode_cell_id_rgba(color)
+
+
+func _decode_cell_id_rgba(color: Color) -> int:
+	var r: int = int(color.r * 255.0 + 0.5)
+	var g: int = int(color.g * 255.0 + 0.5)
+	var b: int = int(color.b * 255.0 + 0.5)
+	var a: int = int(color.a * 255.0 + 0.5)
+	return r * 16777216 + g * 65536 + b * 256 + a
+
+
+## Phase 1C: Lookup cell info by cell_id. Returns dict with center_x, center_z, axial_q, axial_r, neighbors; empty if not found.
+func get_cell_info(cell_id: int) -> Dictionary:
+	if cell_id <= 0:
+		return {}
+	return cell_metadata.get(cell_id, {})
+
+
+## Phase 1C: Hex center from world position using chunk-local math at the given LOD.
+## Use for selection fallback so center matches the hit chunk's grid (same LOD as get_cell_id_at_position).
+## Returns world XZ center; (0, 0) if out of bounds.
+func get_hex_center_at_lod(world_pos: Vector3, lod: int) -> Vector2:
+	var chunk_size: float = _get_chunk_world_size(lod)
+	var cx: int = int(floor(world_pos.x / chunk_size))
+	var cy: int = int(floor(world_pos.z / chunk_size))
+	var grid_lod_x: int = (_lod0_grid.x + (1 << lod) - 1) >> lod
+	var grid_lod_y: int = (_lod0_grid.y + (1 << lod) - 1) >> lod
+	if cx < 0 or cy < 0 or cx >= grid_lod_x or cy >= grid_lod_y:
+		return Vector2.ZERO
+	var chunk_origin_x: float = float(cx) * chunk_size
+	var chunk_origin_z: float = float(cy) * chunk_size
+	var local_x: float = world_pos.x - chunk_origin_x
+	var local_z: float = world_pos.z - chunk_origin_z
+	var hex_size: float = Constants.HEX_RADIUS_M
+	var q: float = (2.0 / 3.0 * local_x) / hex_size
+	var r: float = (-1.0 / 3.0 * local_x + sqrt(3.0) / 3.0 * local_z) / hex_size
+	var cube: Vector3 = Vector3(q, -q - r, r)
+	var rx: float = round(cube.x)
+	var ry: float = round(cube.y)
+	var rz: float = round(cube.z)
+	var x_diff: float = abs(rx - cube.x)
+	var y_diff: float = abs(ry - cube.y)
+	var z_diff: float = abs(rz - cube.z)
+	if x_diff > y_diff and x_diff > z_diff:
+		rx = -ry - rz
+	elif y_diff > z_diff:
+		ry = -rx - rz
+	else:
+		rz = -rx - ry
+	var center_local_x: float = hex_size * (1.5 * rx)
+	var center_local_z: float = hex_size * (sqrt(3.0) / 2.0 * rx + sqrt(3.0) * rz)
+	return Vector2(center_local_x + chunk_origin_x, center_local_z + chunk_origin_z)
+
+
+## Legacy: LOD 0-only hex center (use get_hex_center_at_lod(world_pos, 0) or get_hex_center_at_lod(world_pos, hit_lod) for selection).
+func get_hex_center_lod0(world_pos: Vector3) -> Vector2:
+	return get_hex_center_at_lod(world_pos, 0)
+
+
 ## Interpolated terrain height at world XZ (meters). Uses LOD 0 height cache in TerrainLoader.
 ## Returns -1.0 if chunk not loaded (e.g. hex slice cannot be built).
 func get_height_at(world_x: float, world_z: float) -> float:
@@ -1310,14 +1487,14 @@ func get_height_at(world_x: float, world_z: float) -> float:
 
 func _get_chunk_center_world(chunk_x: int, chunk_y: int, lod: int) -> Vector3:
 	var lod_scale = int(pow(2, lod))
-	var chunk_world_size = 512.0 * _resolution_m * float(lod_scale)
+	var chunk_world_size = float(Constants.CHUNK_SIZE_PX) * _resolution_m * float(lod_scale)
 	var corner = Vector3(chunk_x * chunk_world_size, 0, chunk_y * chunk_world_size)
 	return corner + Vector3(chunk_world_size / 2.0, 0, chunk_world_size / 2.0)
 
 
 func _get_chunk_world_size(lod: int) -> float:
 	"""World-space size of one chunk at this LOD (meters)."""
-	return 512.0 * _resolution_m * pow(2.0, float(lod))
+	return float(Constants.CHUNK_SIZE_PX) * _resolution_m * pow(2.0, float(lod))
 
 
 ## Diagnostic: return current streaming state for logging (read-only).

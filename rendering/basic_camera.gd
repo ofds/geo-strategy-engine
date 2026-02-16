@@ -155,7 +155,8 @@ func _input(event: InputEvent) -> void:
 			orbit_pitch = clamp(orbit_pitch, 10.0, 89.0)
 			
 			_update_camera_transform()
-## Hex center from raycast hit using chunk-local math (same as terrain shader). Returns world XZ center.
+## Hex center from raycast hit using chunk-local analytical math. Phase 1C: used only as fallback when
+## cell metadata is not loaded or cell texture missing; primary path is texture query + metadata lookup.
 func _hex_center_from_hit_chunk_local(hit_pos: Vector3) -> Vector2:
 	var chunk_origin: Vector2
 	var chunk_mgr = get_parent().get_node_or_null("ChunkManager")
@@ -185,7 +186,7 @@ func _hex_center_from_hit_chunk_local(hit_pos: Vector3) -> Vector2:
 func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 	var space_state = get_world_3d().direct_space_state
 	var ray_origin = project_ray_origin(screen_pos)
-	var ray_end = ray_origin + project_ray_normal(screen_pos) * 500000.0
+	var ray_end = ray_origin + project_ray_normal(screen_pos) * Constants.RAYCAST_SELECTION_MAX_DISTANCE_M
 
 	var query = PhysicsRayQueryParameters3D.create(ray_origin, ray_end)
 	query.collision_mask = 1
@@ -194,20 +195,85 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 	if result:
 		var hit_pos = result.position
 
-		# Only allow selection on LOD 0–2 terrain; LOD 3+ is too coarse for hex visual
 		var chunk_mgr = get_parent().get_node_or_null("ChunkManager")
-		if chunk_mgr and chunk_mgr.has_method("get_lod_at_world_position"):
-			var hit_lod = chunk_mgr.get_lod_at_world_position(hit_pos)
-			if hit_lod >= 3:
-				_show_zoom_in_to_select_message()
-				return
-			_clear_zoom_in_message()
+		var hit_lod: int = chunk_mgr.get_lod_at_world_position(hit_pos) if chunk_mgr else -1
+		if hit_lod > Constants.HEX_SELECTION_MAX_LOD:
+			_show_zoom_in_to_select_message()
+			return
+		_clear_zoom_in_message()
 
-		var center: Vector2 = _hex_center_from_hit_chunk_local(hit_pos)
+		# Resolve the exact chunk we hit (from collision shape name) so we sample the same texture as the visible grid.
+		var hit_chunk_lod: int = hit_lod
+		var hit_chunk_x: int = -1
+		var hit_chunk_y: int = -1
+		if result.get("collider") != null and result.get("shape") != null:
+			var body: Node = result.collider as Node
+			var shape_idx: int = result.shape
+			if body != null and shape_idx >= 0 and shape_idx < body.get_child_count():
+				var shape_node: Node = body.get_child(shape_idx)
+				var parts: PackedStringArray = shape_node.name.split("_")
+				var min_parts: int = 4  # "HeightMap_LOD0_66_42"
+				if parts.size() >= min_parts and parts[0] == Constants.HEIGHTMAP_COLLISION_NAME_PREFIX and parts[1].begins_with(Constants.HEIGHTMAP_COLLISION_LOD_PREFIX):
+					hit_chunk_lod = int(parts[1].trim_prefix(Constants.HEIGHTMAP_COLLISION_LOD_PREFIX))
+					hit_chunk_x = int(parts[2])
+					hit_chunk_y = int(parts[3])
+					if hit_chunk_lod >= 0 and hit_chunk_lod <= Constants.HEX_SELECTION_MAX_LOD and hit_chunk_x >= 0 and hit_chunk_y >= 0:
+						hit_lod = hit_chunk_lod
+
+		# Phase 1C: Use hit chunk (from shape) so selection matches visible grid (same texture, extent, origin).
+		var center: Vector2
+		var cell_id: int = 0
+		if chunk_mgr != null:
+			if hit_chunk_x >= 0 and hit_chunk_y >= 0 and hit_chunk_lod >= 0 and hit_chunk_lod <= Constants.HEX_SELECTION_MAX_LOD:
+				cell_id = chunk_mgr.get_cell_id_at_chunk(hit_pos, hit_chunk_x, hit_chunk_y, hit_chunk_lod)
+			else:
+				cell_id = chunk_mgr.get_cell_id_at_position(hit_pos, hit_lod)
+		if cell_id > 0:
+			var info: Dictionary = chunk_mgr.get_cell_info(cell_id) if chunk_mgr else {}
+			if not info.is_empty():
+				center = Vector2(info.center_x, info.center_z)
+				_selected_cell_id = cell_id
+			else:
+				# Metadata not loaded - use hit LOD analytical center so it matches the grid
+				center = chunk_mgr.get_hex_center_at_lod(hit_pos, hit_lod) if chunk_mgr and chunk_mgr.has_method("get_hex_center_at_lod") else Vector2.ZERO
+				_selected_cell_id = 0
+				if center == Vector2.ZERO:
+					return
+		else:
+			_selected_cell_id = 0
+			return
+
+		# Quick diagnostic: print selection flow coordinates (coordinate space mismatch check)
+		var chunk_size: float = chunk_size_m * float(1 << hit_lod)
+		var chunk_origin: Vector2
+		var chunk_x: int
+		var chunk_y: int
+		if hit_chunk_x >= 0 and hit_chunk_y >= 0:
+			chunk_origin = Vector2(float(hit_chunk_x) * chunk_size, float(hit_chunk_y) * chunk_size)
+			chunk_x = hit_chunk_x
+			chunk_y = hit_chunk_y
+		else:
+			chunk_origin = chunk_mgr.get_chunk_origin_at(hit_pos.x, hit_pos.z) if chunk_mgr else Vector2.ZERO
+			chunk_x = int(floor(hit_pos.x / chunk_size))
+			chunk_y = int(floor(hit_pos.z / chunk_size))
+		var local_pos: Vector2 = Vector2(hit_pos.x - chunk_origin.x, hit_pos.z - chunk_origin.y)
+		var cell_center_world_xz: Vector2 = Vector2(center.x, center.y)
+		if OS.is_debug_build():
+			print("\n=== SELECTION DEBUG ===")
+			print("Raycast hit position (world): ", hit_pos)
+			print("Hit chunk LOD: ", hit_lod)
+			print("Hit chunk indices: (", chunk_x, ", ", chunk_y, ")")
+			print("Chunk origin (world): ", chunk_origin)
+			print("Local position: ", local_pos)
+			print("Cell ID: ", cell_id)
+			print("Cell center from metadata (world XZ): ", cell_center_world_xz)
+			print("Cell center passed to hex_selector: ", center)
+			print("======================\n")
 
 		var hex_selector = get_parent().get_node_or_null("HexSelector")
-		if _selected_hex_center.distance_to(center) < 1.0:
-			_selected_hex_center = Vector2(999999, 999999)
+		if _selected_hex_center.distance_to(center) < Constants.SELECTION_SAME_HEX_DISTANCE_M:
+			_selected_hex_center = Vector2(Constants.SELECTION_SENTINEL_NO_HEX, Constants.SELECTION_SENTINEL_NO_HEX)
+			_selected_cell_id = 0
 			if hex_selector and hex_selector.has_method("clear_selection"):
 				hex_selector.clear_selection()
 		else:
@@ -216,7 +282,8 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 			if hex_selector and hex_selector.has_method("set_selected_hex"):
 				hex_selector.set_selected_hex(center)
 	else:
-		_selected_hex_center = Vector2(999999, 999999)
+		_selected_hex_center = Vector2(Constants.SELECTION_SENTINEL_NO_HEX, Constants.SELECTION_SENTINEL_NO_HEX)
+		_selected_cell_id = 0
 		_clear_zoom_in_message()
 		var hex_sel = get_parent().get_node_or_null("HexSelector")
 		if hex_sel and hex_sel.has_method("clear_selection"):
@@ -260,12 +327,13 @@ func _update_debug_visuals(hit_pos: Vector3, center_pos: Vector3) -> void:
 	debug_center_sphere.visible = true
 
 
-var _selected_hex_center: Vector2 = Vector2(999999, 999999)
+var _selected_hex_center: Vector2 = Vector2(Constants.SELECTION_SENTINEL_NO_HEX, Constants.SELECTION_SENTINEL_NO_HEX)
+var _selected_cell_id: int = 0 # Phase 1C: cell_id from texture query for label/metadata
 var _selection_time: float = 0.0 # Seconds since selection; animates lift/border/tint
 
 # Screen-space hex overlay (CompositorEffect); set in _ensure_hex_compositor() from world environment compositor
 var _hex_compositor: CompositorEffect = null
-var _hovered_hex_center: Vector2 = Vector2(-999999.0, -999999.0)
+var _hovered_hex_center: Vector2 = Vector2(Constants.HOVER_SENTINEL_NO_HEX, Constants.HOVER_SENTINEL_NO_HEX)
 
 func _update_hex_selection_uniform() -> void:
 	if _hex_compositor:
@@ -278,7 +346,7 @@ func _process(delta: float) -> void:
 	is_speed_boost_active = Input.is_key_pressed(KEY_SPACE)
 
 	# Animate selection (lift/border/tint fade-in)
-	if _selected_hex_center.x < 900000.0: # Has selection (not sentinel)
+	if _selected_hex_center.x < Constants.SELECTION_SENTINEL_THRESHOLD:
 		_selection_time += delta
 
 	if _zoom_in_label_timer > 0.0:
@@ -362,7 +430,7 @@ func _pan(direction: Vector2, delta: float) -> void:
 func _zoom(direction: int) -> void:
 	"""Zoom in (direction < 0) or out (direction > 0)."""
 	# Percentage-based zoom: ~15% per scroll keeps feel proportional from 1 km to 5,000 km
-	# (e.g. 10 km → ~1.5 km/step; 1,000 km → ~150 km/step; 3,000 km → ~450 km/step)
+	# (e.g. 10 km -> ~1.5 km/step; 1,000 km -> ~150 km/step; 3,000 km -> ~450 km/step)
 	var zoom_factor = 0.15
 	
 	# Calculate new target distance
@@ -481,13 +549,23 @@ func _update_hex_grid_interaction() -> void:
 	var terrain_materials: Array[ShaderMaterial] = []
 	_ensure_hex_compositor()
 
-	# Update terrain materials only (no hex — hex is now screen-space compositor)
+	# Update all terrain materials (shared + per-chunk duplicates for cell texture)
 	var loader = get_tree().get_first_node_in_group("terrain_loader")
 	if loader and loader is TerrainLoader:
 		if loader.shared_terrain_material is ShaderMaterial:
 			terrain_materials.append(loader.shared_terrain_material as ShaderMaterial)
 		if loader.shared_terrain_material_lod2plus is ShaderMaterial:
 			terrain_materials.append(loader.shared_terrain_material_lod2plus as ShaderMaterial)
+	var seen: Dictionary = {}
+	for m in terrain_materials:
+		seen[m.get_instance_id()] = true
+	# Per-chunk materials (Phase 1B cell texture) must also receive camera uniforms
+	for node in get_tree().get_nodes_in_group("terrain_chunks"):
+		if node is MeshInstance3D:
+			var mat = (node as MeshInstance3D).get_surface_override_material(0)
+			if mat is ShaderMaterial and not seen.has(mat.get_instance_id()):
+				terrain_materials.append(mat as ShaderMaterial)
+				seen[mat.get_instance_id()] = true
 	if terrain_materials.is_empty():
 		var single = _get_terrain_material()
 		if single:
@@ -533,13 +611,26 @@ func _update_hex_grid_interaction() -> void:
 		_hover_raycast_frame += 1
 		var do_raycast = (_hover_raycast_frame % 3 == 0)
 
-		if _selected_hex_center.x < 900000.0:
-			var width = Constants.HEX_SIZE_M
-			var size_axial = width / sqrt(3.0)
-			var q = (2.0 / 3.0 * _selected_hex_center.x) / size_axial
-			var r = (-1.0 / 3.0 * _selected_hex_center.x + sqrt(3.0) / 3.0 * _selected_hex_center.y) / size_axial
-			var sel_axial = _axial_round(Vector2(q, r))
-			_update_selection_label(int(sel_axial.x), int(sel_axial.y))
+		if _selected_hex_center.x < Constants.SELECTION_SENTINEL_THRESHOLD:
+			var q: int = 0
+			var r: int = 0
+			if _selected_cell_id > 0:
+				var chunk_mgr_sel = get_parent().get_node_or_null("ChunkManager")
+				if chunk_mgr_sel:
+					var info_sel: Dictionary = chunk_mgr_sel.get_cell_info(_selected_cell_id)
+					if not info_sel.is_empty():
+						q = info_sel.get("axial_q", 0)
+						r = info_sel.get("axial_r", 0)
+			if q == 0 and r == 0:
+				# Fallback: compute axial from center (e.g. metadata not loaded)
+				var width = Constants.HEX_SIZE_M
+				var size_axial = width / sqrt(3.0)
+				var qf = (2.0 / 3.0 * _selected_hex_center.x) / size_axial
+				var rf = (-1.0 / 3.0 * _selected_hex_center.x + sqrt(3.0) / 3.0 * _selected_hex_center.y) / size_axial
+				var sel_axial = _axial_round(Vector2(qf, rf))
+				q = int(sel_axial.x)
+				r = int(sel_axial.y)
+			_update_selection_label(q, r)
 		else:
 			_hide_selection_label()
 
@@ -554,20 +645,42 @@ func _update_hex_grid_interaction() -> void:
 
 			if result:
 				var hit_pos = result.position
-				var center: Vector2 = _hex_center_from_hit_chunk_local(hit_pos)
+				var center: Vector2
+				var chunk_mgr_hover = get_parent().get_node_or_null("ChunkManager")
+				var hit_lod_hover: int = chunk_mgr_hover.get_lod_at_world_position(hit_pos) if chunk_mgr_hover else -1
+				var cell_id_hover: int = chunk_mgr_hover.get_cell_id_at_position(hit_pos, hit_lod_hover) if chunk_mgr_hover else 0
+				var info_hover: Dictionary = {}
+				if cell_id_hover > 0 and chunk_mgr_hover:
+					info_hover = chunk_mgr_hover.get_cell_info(cell_id_hover)
+					if not info_hover.is_empty():
+						center = Vector2(info_hover.center_x, info_hover.center_z)
+					elif chunk_mgr_hover.has_method("get_hex_center_at_lod") and hit_lod_hover >= 0 and hit_lod_hover <= 2:
+						center = chunk_mgr_hover.get_hex_center_at_lod(hit_pos, hit_lod_hover)
+					else:
+						center = _hex_center_from_hit_chunk_local(hit_pos)
+				else:
+					if chunk_mgr_hover and chunk_mgr_hover.has_method("get_hex_center_at_lod") and hit_lod_hover >= 0 and hit_lod_hover <= 2:
+						center = chunk_mgr_hover.get_hex_center_at_lod(hit_pos, hit_lod_hover)
+					if center == Vector2.ZERO:
+						center = _hex_center_from_hit_chunk_local(hit_pos)
 				_hovered_hex_center = center
 				if _hex_compositor:
 					_hex_compositor.hovered_hex_center = _hovered_hex_center
 				_update_debug_visuals(hit_pos, Vector3(center.x, hit_pos.y, center.y))
-				# Axial (q,r) for debug label from center (same convention as shader)
-				var hex_size: float = Constants.HEX_RADIUS_M
-				var q: float = (2.0 / 3.0 * center.x) / hex_size
-				var r: float = (-1.0 / 3.0 * center.x + sqrt(3.0) / 3.0 * center.y) / hex_size
-				var hex_axial = _axial_round(Vector2(q, r))
-				_update_debug_label(int(hex_axial.x), int(hex_axial.y))
+				# Axial (q,r) for debug label: from metadata if available, else from center
+				var q: int = info_hover.get("axial_q", 0) if not info_hover.is_empty() else 0
+				var r: int = info_hover.get("axial_r", 0) if not info_hover.is_empty() else 0
+				if q == 0 and r == 0:
+					var hex_size: float = Constants.HEX_RADIUS_M
+					var qf: float = (2.0 / 3.0 * center.x) / hex_size
+					var rf: float = (-1.0 / 3.0 * center.x + sqrt(3.0) / 3.0 * center.y) / hex_size
+					var hex_axial = _axial_round(Vector2(qf, rf))
+					q = int(hex_axial.x)
+					r = int(hex_axial.y)
+				_update_debug_label(q, r)
 			else:
 				_hide_debug_label()
-				_hovered_hex_center = Vector2(-999999.0, -999999.0)
+				_hovered_hex_center = Vector2(Constants.HOVER_SENTINEL_NO_HEX, Constants.HOVER_SENTINEL_NO_HEX)
 				if _hex_compositor:
 					_hex_compositor.hovered_hex_center = _hovered_hex_center
 
@@ -688,7 +801,7 @@ func _cube_round_shader(cube: Vector3) -> Vector3:
 	return Vector3(rx, ry, rz)
 
 
-## Phase 4d: Compare selection hex grid vs terrain shader hex grid (same world point → same center?).
+## Phase 4d: Compare selection hex grid vs terrain shader hex grid (same world point -> same center?).
 ## Call from F7. Writes docs/PHASE_4D_GRID_COMPARISON_REPORT.md. Verbose [GRID-CMP]/[SDF-CHECK] only if PHASE4D_VERBOSE=1.
 func _run_phase_4d_grid_comparison() -> void:
 	var hex_size: float = Constants.HEX_SIZE_M / sqrt(3.0)  # 577.35
@@ -719,7 +832,7 @@ func _run_phase_4d_grid_comparison() -> void:
 		var local_x: float = world_x - chunk_ox
 		var local_z: float = world_z - chunk_oz
 
-		# --- Method A: Selection (chunk-local, same as Phase 4e — cube = (q, -q-r, r), axial = (rounded.x, rounded.z)) ---
+		# --- Method A: Selection (chunk-local, same as Phase 4e - cube = (q, -q-r, r), axial = (rounded.x, rounded.z)) ---
 		var q_a: float = (2.0 / 3.0 * local_x) / hex_size
 		var r_a: float = (-1.0 / 3.0 * local_x + sqrt(3.0) / 3.0 * local_z) / hex_size
 		var cube_a: Vector3 = Vector3(q_a, -q_a - r_a, r_a)
@@ -751,8 +864,8 @@ func _run_phase_4d_grid_comparison() -> void:
 			var prefix: String = "[GRID-CMP] "
 			print(prefix + "World point: (%.3f, %.3f)" % [world_x, world_z])
 			print(prefix + "Chunk origin: (%.3f, %.3f)" % [chunk_ox, chunk_oz])
-			print(prefix + "Method A (chunk-local) — local_xz: (%.3f, %.3f), axial: (%.0f, %.0f), center: (%.3f, %.3f)" % [local_x, local_z, aq, ar, center_a_x, center_a_z])
-			print(prefix + "Method B (shader) — same local, axial: (%.0f, %.0f), center: (%.3f, %.3f)" % [bq, br, center_b_x, center_b_z])
+			print(prefix + "Method A (chunk-local) - local_xz: (%.3f, %.3f), axial: (%.0f, %.0f), center: (%.3f, %.3f)" % [local_x, local_z, aq, ar, center_a_x, center_a_z])
+			print(prefix + "Method B (shader) - same local, axial: (%.0f, %.0f), center: (%.3f, %.3f)" % [bq, br, center_b_x, center_b_z])
 			print(prefix + "MATCH: %s  Offset: (%.6f, %.6f) m" % [("yes" if match_yes else "no"), dx, dz])
 			print("")
 

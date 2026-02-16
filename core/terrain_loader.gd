@@ -30,6 +30,11 @@ const HEIGHT_CACHE_MAX: int = 100
 var _height_cache: Dictionary = {}
 var _height_cache_order: Array = []
 
+# Cell texture cache: "lod{x}_{y}" -> Texture2D. Avoid reloading same chunk cell texture.
+const CELL_TEXTURE_CACHE_MAX: int = 200
+var _cell_texture_cache: Dictionary = {}
+var _cell_texture_cache_order: Array = []
+
 # Phase B micro-steps: MESH -> SCENE -> COLLISION (each step can run on a different frame)
 enum PhaseBStep { MESH, SCENE, COLLISION }
 
@@ -166,11 +171,23 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 		debug_material.cull_mode = BaseMaterial3D.CULL_DISABLED
 		mesh_instance.set_surface_override_material(0, debug_material)
 	else:
-		# Hex overlay only on LOD 0-1 so grid is visible where it matters; LOD 2+ no overlay to reduce doubling.
+		# Phase 1B: per-chunk cell texture. Instance shader params for sampler2D are not applied in Godot 4,
+		# so we use a material duplicate per chunk with cell_id_texture set on the material.
+		var cell_tex: Texture2D = _load_cell_texture(chunk_x, chunk_y, lod)
 		if lod <= 1:
-			mesh_instance.set_surface_override_material(0, shared_terrain_material)
+			if cell_tex:
+				var mat: ShaderMaterial = shared_terrain_material.duplicate() as ShaderMaterial
+				mat.set_shader_parameter("cell_id_texture", cell_tex)
+				mesh_instance.set_surface_override_material(0, mat)
+			else:
+				mesh_instance.set_surface_override_material(0, shared_terrain_material)
 		else:
-			mesh_instance.set_surface_override_material(0, shared_terrain_material_lod2plus)
+			if cell_tex:
+				var mat: ShaderMaterial = shared_terrain_material_lod2plus.duplicate() as ShaderMaterial
+				mat.set_shader_parameter("cell_id_texture", cell_tex)
+				mesh_instance.set_surface_override_material(0, mat)
+			else:
+				mesh_instance.set_surface_override_material(0, shared_terrain_material_lod2plus)
 	
 	# Position chunk in world space using LOD-aware positioning
 	var world_pos = _chunk_to_world_position(chunk_x, chunk_y, lod)
@@ -194,6 +211,38 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 		print("[TIME] Total chunk load: %dms (lod%d_x%d_y%d)" % [total_ms, lod, chunk_x, chunk_y])
 	
 	return mesh_instance
+
+
+## Phase 1C: Expose cell texture for selection (ChunkManager samples texture to get cell_id at position).
+## Reuses same cache as rendering.
+func get_cell_texture_for_selection(chunk_x: int, chunk_y: int, lod: int) -> Texture2D:
+	return _load_cell_texture(chunk_x, chunk_y, lod)
+
+
+## Load cell ID texture for a chunk (Phase 1B). Path: data/terrain/cells/lod{L}/chunk_{x}_{y}_cells.png
+## Phase 1A only generates textures for LOD 0, 1, 2; LOD 3+ return null without warning.
+## Returns Texture2D or null if missing. Uses FIFO cache.
+func _load_cell_texture(chunk_x: int, chunk_y: int, lod: int) -> Texture2D:
+	if lod > 2:
+		return null
+	var cache_key: String = "lod%d_%d_%d" % [lod, chunk_x, chunk_y]
+	if _cell_texture_cache.has(cache_key):
+		return _cell_texture_cache[cache_key]
+	var path: String = "res://data/terrain/cells/lod%d/chunk_%d_%d_cells.png" % [lod, chunk_x, chunk_y]
+	# Load as imported resource so it works on export (Image.load() does not work in exported builds).
+	# If cell decode is wrong (sRGB applied), set import preset for *cells*.png to linear / no sRGB.
+	var tex: Texture2D = load(path) as Texture2D
+	if not tex:
+		if OS.is_debug_build():
+			push_warning("TerrainLoader: Cell texture not found or failed to load: " + path)
+		return null
+	# Cache (FIFO eviction)
+	if _cell_texture_cache.size() >= CELL_TEXTURE_CACHE_MAX and _cell_texture_cache_order.size() > 0:
+		var oldest = _cell_texture_cache_order.pop_front()
+		_cell_texture_cache.erase(oldest)
+	_cell_texture_cache[cache_key] = tex
+	_cell_texture_cache_order.append(cache_key)
+	return tex
 
 
 func _chunk_to_world_position(chunk_x: int, chunk_y: int, lod: int) -> Vector3:
@@ -530,7 +579,12 @@ func _generate_mesh_lod(heights: Array[float], _vertex_spacing: float, lod: int,
 	
 	var vertices = PackedVector3Array()
 	var normals = PackedVector3Array()
+	var uvs = PackedVector2Array()
 	var indices = PackedInt32Array()
+	
+	# UV scale: 0..1 over chunk for cell texture sampling (Phase 1B)
+	var uv_scale_x: float = 1.0 / maxf(1.0, float(mesh_res) - 1.0)
+	var uv_scale_y: float = 1.0 / maxf(1.0, float(mesh_res) - 1.0)
 	
 	# Generate vertices by sampling the heightmap
 	for y in range(mesh_res):
@@ -553,6 +607,7 @@ func _generate_mesh_lod(heights: Array[float], _vertex_spacing: float, lod: int,
 				y * actual_vertex_spacing
 			)
 			vertices.append(pos)
+			uvs.append(Vector2(float(x) * uv_scale_x, float(y) * uv_scale_y))
 	
 	if DEBUG_CHUNK_TIMING and verbose and OS.is_debug_build():
 		print("Generated %d vertices" % vertices.size())
@@ -590,6 +645,7 @@ func _generate_mesh_lod(heights: Array[float], _vertex_spacing: float, lod: int,
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = vertices
 	arrays[Mesh.ARRAY_NORMAL] = normals
+	arrays[Mesh.ARRAY_TEX_UV] = uvs
 	arrays[Mesh.ARRAY_INDEX] = indices
 	
 	var mesh = ArrayMesh.new()
@@ -798,7 +854,10 @@ func _compute_chunk_data(args: Dictionary) -> void:
 	var mesh_res: int = mesh_resolutions[lod]
 	var sample_stride: int = cpx / mesh_res
 	var actual_vertex_spacing: float = chunk_world_size / float(mesh_res - 1)
+	var uv_scale_x: float = 1.0 / maxf(1.0, float(mesh_res) - 1.0)
+	var uv_scale_y: float = 1.0 / maxf(1.0, float(mesh_res) - 1.0)
 	var vertices = PackedVector3Array()
+	var uvs = PackedVector2Array()
 	var indices = PackedInt32Array()
 	for y in range(mesh_res):
 		for x in range(mesh_res):
@@ -806,6 +865,7 @@ func _compute_chunk_data(args: Dictionary) -> void:
 			var py = mini(y * sample_stride, cpx - 1)
 			var h = heights[py * cpx + px]
 			vertices.append(Vector3(x * actual_vertex_spacing, h, y * actual_vertex_spacing))
+			uvs.append(Vector2(float(x) * uv_scale_x, float(y) * uv_scale_y))
 	for y in range(mesh_res - 1):
 		for x in range(mesh_res - 1):
 			var top_left = y * mesh_res + x
@@ -830,6 +890,7 @@ func _compute_chunk_data(args: Dictionary) -> void:
 	args["result"] = {
 		"vertices": vertices,
 		"normals": normals,
+		"uvs": uvs,
 		"indices": indices,
 		"height_data": height_data,
 		"chunk_x": chunk_x,
@@ -861,22 +922,26 @@ func finish_load_step_mesh(computed_data: Dictionary) -> ArrayMesh:
 			Vector3(0, avg_y, chunk_world_size)
 		])
 		var u_normals = PackedVector3Array([Vector3.UP, Vector3.UP, Vector3.UP, Vector3.UP])
+		var u_uvs = PackedVector2Array([Vector2(0, 0), Vector2(1, 0), Vector2(1, 1), Vector2(0, 1)])
 		var u_indices = PackedInt32Array([0, 1, 2, 0, 2, 3])
 		var u_arrays: Array = []
 		u_arrays.resize(Mesh.ARRAY_MAX)
 		u_arrays[Mesh.ARRAY_VERTEX] = u_verts
 		u_arrays[Mesh.ARRAY_NORMAL] = u_normals
+		u_arrays[Mesh.ARRAY_TEX_UV] = u_uvs
 		u_arrays[Mesh.ARRAY_INDEX] = u_indices
 		var u_mesh = ArrayMesh.new()
 		u_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, u_arrays)
 		return u_mesh
 	var vertices: PackedVector3Array = computed_data["vertices"]
 	var normals: PackedVector3Array = computed_data["normals"]
+	var uvs: PackedVector2Array = computed_data["uvs"]
 	var indices: PackedInt32Array = computed_data["indices"]
 	var arrays: Array = []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = vertices
 	arrays[Mesh.ARRAY_NORMAL] = normals
+	arrays[Mesh.ARRAY_TEX_UV] = uvs
 	arrays[Mesh.ARRAY_INDEX] = indices
 	var mesh = ArrayMesh.new()
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
@@ -906,10 +971,22 @@ func finish_load_step_scene(computed_data: Dictionary, mesh: ArrayMesh, debug_co
 		debug_material.cull_mode = BaseMaterial3D.CULL_DISABLED
 		mesh_instance.set_surface_override_material(0, debug_material)
 	else:
+		# Phase 1B: per-chunk cell texture on material duplicate (instance sampler param not applied in Godot 4)
+		var cell_tex: Texture2D = _load_cell_texture(chunk_x, chunk_y, lod)
 		if lod <= 1:
-			mesh_instance.set_surface_override_material(0, shared_terrain_material)
+			if cell_tex:
+				var mat: ShaderMaterial = shared_terrain_material.duplicate() as ShaderMaterial
+				mat.set_shader_parameter("cell_id_texture", cell_tex)
+				mesh_instance.set_surface_override_material(0, mat)
+			else:
+				mesh_instance.set_surface_override_material(0, shared_terrain_material)
 		else:
-			mesh_instance.set_surface_override_material(0, shared_terrain_material_lod2plus)
+			if cell_tex:
+				var mat: ShaderMaterial = shared_terrain_material_lod2plus.duplicate() as ShaderMaterial
+				mat.set_shader_parameter("cell_id_texture", cell_tex)
+				mesh_instance.set_surface_override_material(0, mat)
+			else:
+				mesh_instance.set_surface_override_material(0, shared_terrain_material_lod2plus)
 	mesh_instance.position = world_pos
 	return mesh_instance
 

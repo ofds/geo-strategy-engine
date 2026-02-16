@@ -389,7 +389,7 @@ func _compute_grid_normals(vertices: PackedVector3Array, normals: PackedVector3A
 			normals[idx] = accum[idx].normalized()
 
 
-# Rim is now drawn in screen-space shader (hex_overlay_screen.glsl) — thick, visible, scales with altitude.
+# Rim is now drawn in screen-space shader (hex_overlay_screen.glsl) - thick, visible, scales with altitude.
 # func _build_golden_rim_mesh() -> ArrayMesh:
 # 	var hex_size: float = Constants.HEX_SIZE_M
 # 	var corners: PackedVector2Array = _hex_corners_local(hex_size)
@@ -449,6 +449,19 @@ func set_selected_hex(center_xz: Vector2) -> void:
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
 	_slice_instance.material_override = mat
 	add_child(_slice_instance)
+
+	# Quick diagnostic: print hex_selector positioning (coordinate space mismatch check)
+	if OS.is_debug_build():
+		var world_center: Vector3 = Vector3(_center_x, 0.0, _center_z)
+		print("\n=== HEX_SELECTOR DEBUG ===")
+		print("Received world_center: ", world_center)
+		if _slice_instance != null:
+			print("hex_mesh.global_position: ", _slice_instance.global_position)
+			print("hex_mesh.position (local): ", _slice_instance.position)
+			var parent_node: Node = _slice_instance.get_parent()
+			print("hex_mesh parent: ", parent_node.name)
+			print("hex_mesh parent global_position: ", parent_node.global_position)
+		print("==========================\n")
 
 	# Rim is now drawn in screen-space shader (hex_overlay_screen.glsl)
 	# var rim_mesh: ArrayMesh = _build_golden_rim_mesh()

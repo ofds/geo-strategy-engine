@@ -19,17 +19,20 @@ uniform vec2 overview_origin = vec2(0.0, 0.0);
 uniform vec2 overview_size = vec2(1.0, 1.0);
 uniform bool use_overview = false;
 
-// Hex grid: same lens as selection (basic_camera.gd). hex_size = pointy-top radius = HEX_SIZE_M/sqrt(3).
-uniform float hex_size = 577.35;
+// Hex grid: texture-based cell boundaries (Phase 1B). No analytical hex math.
+uniform float hex_size = 577.35; // Kept for camera/selection parity; not used for grid (texture-based).
 uniform float hex_line_width = 15.0;
 uniform float hex_line_softness = 3.0;
 uniform float hex_grid_strength = 0.6;
 uniform vec3 hex_line_color = vec3(0.08, 0.10, 0.06);
 uniform bool show_hex_grid = true;
+// Per-chunk cell ID texture (RGBA → 32-bit id). NEAREST filter set by loader.
+// filter_nearest required so boundary detection gets exact cell IDs (no blending)
+uniform sampler2D cell_id_texture : hint_default_black, filter_nearest;
 instance uniform vec2 chunk_origin_xz = vec2(0.0, 0.0);
 
 varying vec3 v_world_pos;
-varying vec2 v_local_xz;
+varying vec2 v_uv;
 varying vec3 v_view_dir;
 varying float v_elevation;
 varying vec3 v_world_normal;
@@ -52,55 +55,18 @@ vec3 terrain_low_elev_color(float elev) {
 	return texture(elevation_palette, vec2(t, 0.5)).rgb;
 }
 
-// --- Same lens as selection: formulas match basic_camera.gd (world_to_axial, axial_to_world, hex shape). ---
-vec2 world_to_axial(vec2 xz, float size) {
-	return vec2((2.0/3.0 * xz.x) / size, (-1.0/3.0 * xz.x + sqrt(3.0)/3.0 * xz.y) / size);
-}
-vec2 axial_to_center(vec2 axial, float size) {
-	return vec2(size * (1.5 * axial.x), size * (sqrt(3.0)/2.0 * axial.x + sqrt(3.0) * axial.y));
-}
-vec3 cube_round(vec3 c) {
-	vec3 r = round(c);
-	vec3 d = abs(r - c);
-	if (d.x > d.y && d.x > d.z) r.x = -r.y - r.z;
-	else if (d.y > d.z) r.y = -r.x - r.z;
-	else r.z = -r.x - r.y;
-	return r;
-}
-
-// Hex SDF: signed distance to hex boundary (negative inside, positive outside)
-// Pointy-top: vertices at top/bottom (p.y = ±radius), flat edges at left/right (p.x = ±apothem).
-// p.x = world X offset, p.y = world Z offset from hex center.
-// apothem = center-to-flat-edge distance = hex_size * sqrt(3) / 2 ≈ 500m
-float hex_sdf(vec2 p, float apothem) {
-	p = abs(p);
-	// Pointy-top SDF: boundary at (0, ±radius) and (±apothem, 0)
-	return max(dot(p, vec2(0.5, 0.8660254)), p.x) - apothem;
-}
-
-// Compute distance to nearest hex boundary in a tiling grid
-// Returns abs(signed distance) — always positive, 0 at boundary
-float hex_grid_distance(vec2 local_xz, float size) {
-	// Find which hex cell this pixel is in
-	vec2 axial = world_to_axial(local_xz, size);
-	vec3 cube = vec3(axial.x, -axial.x - axial.y, axial.y);
-	vec3 rounded = cube_round(cube);
-	vec2 center = axial_to_center(vec2(rounded.x, rounded.z), size);
-
-	// Local position relative to hex center
-	vec2 p = local_xz - center;
-
-	// Apothem = center to flat edge = size * sqrt(3) / 2
-	float apothem = size * 0.8660254;
-
-	// Distance to boundary (0 at edges, positive moving inward or outward)
-	return abs(hex_sdf(p, apothem));
+// Decode RGBA to 32-bit cell ID (Phase 1A encoding: R*16777216 + G*65536 + B*256 + A)
+uint decode_cell_id(vec4 rgba) {
+	return uint(floor(rgba.r * 255.0 + 0.5)) * 16777216u +
+	       uint(floor(rgba.g * 255.0 + 0.5)) * 65536u +
+	       uint(floor(rgba.b * 255.0 + 0.5)) * 256u +
+	       uint(floor(rgba.a * 255.0 + 0.5));
 }
 
 void vertex() {
 	vec4 world_pos = MODEL_MATRIX * vec4(VERTEX, 1.0);
 	v_world_pos = world_pos.xyz;
-	v_local_xz = world_pos.xz - chunk_origin_xz;
+	v_uv = UV;
 	v_elevation = world_pos.y;
 	v_world_normal = (MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz;
 }
@@ -152,12 +118,19 @@ void fragment() {
 	float fog_factor = smoothstep(fog_start, fog_end_actual, dist);
 	base_col = mix(base_col, fog_color, fog_factor);
 
-	// Hex grid: SDF-based boundary distance, chunk-local for precision
+	// Hex grid: texture-based cell boundaries (Phase 1B). Boundary = pixel differs from neighbor.
 	float grid_mix = 0.0;
 	if (show_hex_grid) {
-		float bd = hex_grid_distance(v_local_xz, hex_size);
-		float aa = fwidth(bd) * hex_line_softness;
-		float line_mask = 1.0 - smoothstep(hex_line_width - aa, hex_line_width + aa, bd);
+		vec4 cell_rgba = texture(cell_id_texture, v_uv);
+		uint cell_id = decode_cell_id(cell_rgba);
+		ivec2 tex_size = textureSize(cell_id_texture, 0);
+		vec2 duv = vec2(1.0 / float(max(tex_size.x, 1)), 1.0 / float(max(tex_size.y, 1)));
+		uint n0 = decode_cell_id(texture(cell_id_texture, v_uv + vec2(duv.x, 0.0)));
+		uint n1 = decode_cell_id(texture(cell_id_texture, v_uv - vec2(duv.x, 0.0)));
+		uint n2 = decode_cell_id(texture(cell_id_texture, v_uv + vec2(0.0, duv.y)));
+		uint n3 = decode_cell_id(texture(cell_id_texture, v_uv - vec2(0.0, duv.y)));
+		bool on_boundary = (cell_id != n0) || (cell_id != n1) || (cell_id != n2) || (cell_id != n3);
+		float line_mask = on_boundary ? 1.0 : 0.0;
 
 		// Fade on steep slopes
 		line_mask *= smoothstep(0.35, 0.65, dot(n, vec3(0.0, 1.0, 0.0)));

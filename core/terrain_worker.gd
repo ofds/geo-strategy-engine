@@ -214,7 +214,10 @@ static func compute_chunk_data(args: Dictionary) -> void:
 	if do_height_diag and OS.is_debug_build():
 		print("[DECIMATE] LOD %d step=%d -> %dx%d vertices" % [lod, sample_stride, mesh_res, mesh_res])
 	var actual_vertex_spacing: float = chunk_world_size / float(mesh_res - 1)
+	var uv_scale_x: float = 1.0 / maxf(1.0, float(mesh_res) - 1.0)
+	var uv_scale_y: float = 1.0 / maxf(1.0, float(mesh_res) - 1.0)
 	var vertices = PackedVector3Array()
+	var uvs = PackedVector2Array()
 	var indices = PackedInt32Array()
 	for y in range(mesh_res):
 		for x in range(mesh_res):
@@ -222,6 +225,7 @@ static func compute_chunk_data(args: Dictionary) -> void:
 			var py = mini(y * sample_stride, cpx - 1)
 			var h = heights[py * cpx + px]
 			vertices.append(Vector3(x * actual_vertex_spacing, h, y * actual_vertex_spacing))
+			uvs.append(Vector2(float(x) * uv_scale_x, float(y) * uv_scale_y))
 	# Stage 3: Vertex Y range
 	var vy_min: float = 1e9
 	var vy_max: float = -1e9
@@ -278,6 +282,7 @@ static func compute_chunk_data(args: Dictionary) -> void:
 	args["result"] = {
 		"vertices": vertices,
 		"normals": normals,
+		"uvs": uvs,
 		"indices": indices,
 		"height_data": height_data,
 		"chunk_x": chunk_x,
