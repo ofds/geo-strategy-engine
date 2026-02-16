@@ -15,6 +15,9 @@ const HEIGHT_SAMPLE_WARN_RATIO := 0.2  # Warn if > 20% of samples return -1
 # Small offset above terrain so slice doesn't z-fight with terrain at the border
 const SLICE_TERRAIN_OFFSET_M := 0.5
 
+## When true, print hex_selector positioning on each selection (for coordinate-space checks).
+@export var DEBUG_VERBOSE: bool = false
+
 var _chunk_manager: Node = null
 var _slice_instance: MeshInstance3D = null
 var _slice_mesh: ArrayMesh = null
@@ -451,7 +454,7 @@ func set_selected_hex(center_xz: Vector2) -> void:
 	add_child(_slice_instance)
 
 	# Quick diagnostic: print hex_selector positioning (coordinate space mismatch check)
-	if OS.is_debug_build():
+	if DEBUG_VERBOSE and OS.is_debug_build():
 		var world_center: Vector3 = Vector3(_center_x, 0.0, _center_z)
 		print("\n=== HEX_SELECTOR DEBUG ===")
 		print("Received world_center: ", world_center)

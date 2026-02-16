@@ -29,6 +29,8 @@ var frame_count: int = 0
 # Height pipeline diagnostic: when true, print [SHADER] altitude/overview_blend once per second (enable with ChunkManager DEBUG_DIAGNOSTIC for full pipeline)
 @export var DEBUG_DIAGNOSTIC: bool = false
 var _shader_diag_timer: float = 0.0
+# Diagnostic: use analytical hex center for slice instead of metadata (compare alignment with grid)
+@export var USE_ANALYTICAL_FOR_TEST: bool = false
 
 # Speed boost
 var speed_boost_multiplier: float = 10.0 # 10x speed when Space is held
@@ -243,6 +245,10 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 			_selected_cell_id = 0
 			return
 
+		# Analytical center (chunk-local hex math) for diagnostic comparison
+		var analytical_center: Vector2 = chunk_mgr.get_hex_center_at_lod(hit_pos, hit_lod) if chunk_mgr and chunk_mgr.has_method("get_hex_center_at_lod") else Vector2.ZERO
+		var world_center: Vector2 = analytical_center if USE_ANALYTICAL_FOR_TEST else center
+
 		# Quick diagnostic: print selection flow coordinates (coordinate space mismatch check)
 		var chunk_size: float = chunk_size_m * float(1 << hit_lod)
 		var chunk_origin: Vector2
@@ -258,7 +264,7 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 			chunk_y = int(floor(hit_pos.z / chunk_size))
 		var local_pos: Vector2 = Vector2(hit_pos.x - chunk_origin.x, hit_pos.z - chunk_origin.y)
 		var cell_center_world_xz: Vector2 = Vector2(center.x, center.y)
-		if OS.is_debug_build():
+		if DEBUG_DIAGNOSTIC and OS.is_debug_build():
 			print("\n=== SELECTION DEBUG ===")
 			print("Raycast hit position (world): ", hit_pos)
 			print("Hit chunk LOD: ", hit_lod)
@@ -267,20 +273,25 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 			print("Local position: ", local_pos)
 			print("Cell ID: ", cell_id)
 			print("Cell center from metadata (world XZ): ", cell_center_world_xz)
-			print("Cell center passed to hex_selector: ", center)
+			print("Cell center from analytical (world XZ): ", analytical_center)
+			print("Difference (metadata - analytical): ", Vector2(center.x - analytical_center.x, center.y - analytical_center.y))
+			print("Center passed to hex_selector: ", world_center, " (analytical)" if USE_ANALYTICAL_FOR_TEST else " (metadata)")
 			print("======================\n")
 
+		if USE_ANALYTICAL_FOR_TEST and DEBUG_DIAGNOSTIC and OS.is_debug_build():
+			print(">>> USING ANALYTICAL CENTER FOR SLICE <<<")
+
 		var hex_selector = get_parent().get_node_or_null("HexSelector")
-		if _selected_hex_center.distance_to(center) < Constants.SELECTION_SAME_HEX_DISTANCE_M:
+		if _selected_hex_center.distance_to(world_center) < Constants.SELECTION_SAME_HEX_DISTANCE_M:
 			_selected_hex_center = Vector2(Constants.SELECTION_SENTINEL_NO_HEX, Constants.SELECTION_SENTINEL_NO_HEX)
 			_selected_cell_id = 0
 			if hex_selector and hex_selector.has_method("clear_selection"):
 				hex_selector.clear_selection()
 		else:
-			_selected_hex_center = center
+			_selected_hex_center = world_center
 			_selection_time = 0.0
 			if hex_selector and hex_selector.has_method("set_selected_hex"):
-				hex_selector.set_selected_hex(center)
+				hex_selector.set_selected_hex(world_center)
 	else:
 		_selected_hex_center = Vector2(Constants.SELECTION_SENTINEL_NO_HEX, Constants.SELECTION_SENTINEL_NO_HEX)
 		_selected_cell_id = 0
@@ -581,6 +592,9 @@ func _update_hex_grid_interaction() -> void:
 		terrain_material.set_shader_parameter("terrain_center_xz", _terrain_center_xz)
 		terrain_material.set_shader_parameter("terrain_radius_m", _terrain_radius_m)
 		terrain_material.set_shader_parameter("show_hex_grid", _grid_visible)
+		# Diagnostic: terrain color (elevation) and grid (cell texture) — toggle with F10 / F11
+		terrain_material.set_shader_parameter("debug_show_elevation", _debug_show_elevation)
+		terrain_material.set_shader_parameter("debug_show_cell_texture", _debug_show_cell_texture)
 		# Same lens as selection: pointy-top radius
 		terrain_material.set_shader_parameter("hex_size", Constants.HEX_SIZE_M / sqrt(3.0))
 
@@ -605,6 +619,36 @@ func _update_hex_grid_interaction() -> void:
 			_f1_pressed_last_frame = true
 	else:
 		_f1_pressed_last_frame = false
+
+	# F10: toggle elevation debug (grayscale + red bands) — only one diagnostic at a time
+	if Input.is_key_pressed(KEY_F10):
+		if not _f10_pressed_last_frame:
+			_debug_show_elevation = not _debug_show_elevation
+			if _debug_show_elevation:
+				_debug_show_cell_texture = false
+			for terrain_material in terrain_materials:
+				terrain_material.set_shader_parameter("debug_show_elevation", _debug_show_elevation)
+				terrain_material.set_shader_parameter("debug_show_cell_texture", _debug_show_cell_texture)
+			if OS.is_debug_build():
+				print("[Camera] Elevation debug: ", "ON" if _debug_show_elevation else "OFF")
+			_f10_pressed_last_frame = true
+	else:
+		_f10_pressed_last_frame = false
+
+	# F11: toggle cell texture debug (RED = missing, colored = bound)
+	if Input.is_key_pressed(KEY_F11):
+		if not _f11_pressed_last_frame:
+			_debug_show_cell_texture = not _debug_show_cell_texture
+			if _debug_show_cell_texture:
+				_debug_show_elevation = false
+			for terrain_material in terrain_materials:
+				terrain_material.set_shader_parameter("debug_show_elevation", _debug_show_elevation)
+				terrain_material.set_shader_parameter("debug_show_cell_texture", _debug_show_cell_texture)
+			if OS.is_debug_build():
+				print("[Camera] Cell texture debug: ", "ON" if _debug_show_cell_texture else "OFF")
+			_f11_pressed_last_frame = true
+	else:
+		_f11_pressed_last_frame = false
 
 	var overview_node = get_tree().get_first_node_in_group("overview_plane")
 	if overview_node and overview_node is MeshInstance3D:
@@ -745,6 +789,11 @@ var _f3_pressed_last_frame: bool = false
 var _f4_pressed_last_frame: bool = false
 var _f6_pressed_last_frame: bool = false
 var _f7_pressed_last_frame: bool = false
+var _f10_pressed_last_frame: bool = false
+var _f11_pressed_last_frame: bool = false
+# Diagnostic: only one active at a time (elevation vs cell texture)
+var _debug_show_elevation: bool = false
+var _debug_show_cell_texture: bool = false
 var _debug_label: Label = null
 var _selection_label: Label = null
 var _hex_diag_printed: bool = false

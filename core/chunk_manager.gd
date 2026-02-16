@@ -1415,8 +1415,8 @@ func _get_cell_id_at_chunk_impl(world_pos: Vector3, cx: int, cy: int, hit_lod: i
 		return 0
 	var w: int = img.get_width()
 	var h: int = img.get_height()
-	var px: int = clampi(int(round(local_x / chunk_size * float(w))), 0, w - 1)
-	var py: int = clampi(int(round(local_z / chunk_size * float(h))), 0, h - 1)
+	var px: int = clampi(int(round(local_x / chunk_size * float(w - 1))), 0, w - 1)
+	var py: int = clampi(int(round(local_z / chunk_size * float(h - 1))), 0, h - 1)
 	var color: Color = img.get_pixel(px, py)
 	return _decode_cell_id_rgba(color)
 
