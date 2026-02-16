@@ -21,13 +21,15 @@ uniform bool use_overview = false;
 
 // Hex grid: same lens as selection (basic_camera.gd). hex_size = pointy-top radius = HEX_SIZE_M/sqrt(3).
 uniform float hex_size = 577.35;
-uniform float hex_line_width = 30.0;
-uniform float hex_line_softness = 5.0;
-uniform float hex_grid_strength = 10;
-uniform vec3 hex_line_color = vec3(0.07, 0.09, 0.05);
+uniform float hex_line_width = 15.0;
+uniform float hex_line_softness = 3.0;
+uniform float hex_grid_strength = 0.6;
+uniform vec3 hex_line_color = vec3(0.08, 0.10, 0.06);
 uniform bool show_hex_grid = true;
+instance uniform vec2 chunk_origin_xz = vec2(0.0, 0.0);
 
 varying vec3 v_world_pos;
+varying vec2 v_local_xz;
 varying vec3 v_view_dir;
 varying float v_elevation;
 varying vec3 v_world_normal;
@@ -35,41 +37,19 @@ varying vec3 v_world_normal;
 // Water (elevation below 5m = sea)
 const float WATER_ELEVATION_M = 5.0;
 
-// Height-based terrain colors
-const float TRANSITION_M = 200.0;
-const vec3 COLOR_LOWLAND = vec3(0.18, 0.32, 0.12);
-const vec3 COLOR_FOOTHILLS = vec3(0.25, 0.42, 0.15);
-const vec3 COLOR_ALPINE = vec3(0.35, 0.48, 0.18);
-const vec3 COLOR_ROCK = vec3(0.45, 0.38, 0.30);
-const vec3 COLOR_HIGH_ROCK = vec3(0.62, 0.60, 0.58);
-const vec3 COLOR_SNOW = vec3(0.92, 0.93, 0.95);
-const vec3 COLOR_STEEP_ROCK = vec3(0.40, 0.35, 0.28);
-
-const vec3 COLOR_COASTAL_LOW = vec3(0.16, 0.29, 0.11);
-const vec3 COLOR_PLAINS = vec3(0.18, 0.32, 0.12);
-const vec3 COLOR_LOW_HILLS = vec3(0.20, 0.34, 0.13);
-const float LOW_ELEV_BLEND_M = 50.0;
+// Elevation colors: data-driven from palette texture (single source of truth with Python pipeline)
+uniform sampler2D elevation_palette : source_color, filter_linear, repeat_disable;
+uniform float max_elevation_m = 10000.0;
+uniform vec3 steep_rock_color = vec3(0.40, 0.35, 0.28);
 
 vec3 terrain_height_color(float elev) {
-	float t300 = smoothstep(300.0 - TRANSITION_M, 300.0 + TRANSITION_M, elev);
-	float t800 = smoothstep(800.0 - TRANSITION_M, 800.0 + TRANSITION_M, elev);
-	float t1500 = smoothstep(1500.0 - TRANSITION_M, 1500.0 + TRANSITION_M, elev);
-	float t2200 = smoothstep(2200.0 - TRANSITION_M, 2200.0 + TRANSITION_M, elev);
-	float t3000 = smoothstep(3000.0 - TRANSITION_M, 3000.0 + TRANSITION_M, elev);
-	vec3 c = mix(COLOR_LOWLAND, COLOR_FOOTHILLS, t300);
-	c = mix(c, COLOR_ALPINE, t800);
-	c = mix(c, COLOR_ROCK, t1500);
-	c = mix(c, COLOR_HIGH_ROCK, t2200);
-	c = mix(c, COLOR_SNOW, t3000);
-	return c;
+	float t = clamp(elev / max_elevation_m, 0.0, 1.0);
+	return texture(elevation_palette, vec2(t, 0.5)).rgb;
 }
 
 vec3 terrain_low_elev_color(float elev) {
-	float t50 = smoothstep(50.0 - LOW_ELEV_BLEND_M, 50.0 + LOW_ELEV_BLEND_M, elev);
-	float t150 = smoothstep(150.0 - LOW_ELEV_BLEND_M, 150.0 + LOW_ELEV_BLEND_M, elev);
-	vec3 c = mix(COLOR_COASTAL_LOW, COLOR_PLAINS, t50);
-	c = mix(c, COLOR_LOW_HILLS, t150);
-	return c;
+	float t = clamp(elev / max_elevation_m, 0.0, 1.0);
+	return texture(elevation_palette, vec2(t, 0.5)).rgb;
 }
 
 // --- Same lens as selection: formulas match basic_camera.gd (world_to_axial, axial_to_world, hex shape). ---
@@ -87,38 +67,40 @@ vec3 cube_round(vec3 c) {
 	else r.z = -r.x - r.y;
 	return r;
 }
-float seg_dist(vec2 p, vec2 a, vec2 b) {
-	vec2 pa = p - a, ba = b - a;
-	float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
-	return length(pa - ba * h);
+
+// Hex SDF: signed distance to hex boundary (negative inside, positive outside)
+// Pointy-top: vertices at top/bottom (p.y = ±radius), flat edges at left/right (p.x = ±apothem).
+// p.x = world X offset, p.y = world Z offset from hex center.
+// apothem = center-to-flat-edge distance = hex_size * sqrt(3) / 2 ≈ 500m
+float hex_sdf(vec2 p, float apothem) {
+	p = abs(p);
+	// Pointy-top SDF: boundary at (0, ±radius) and (±apothem, 0)
+	return max(dot(p, vec2(0.5, 0.8660254)), p.x) - apothem;
 }
-// Inward side of edge a->b; inside hex when all six >= 0.
-float edge_side(vec2 p, vec2 a, vec2 b) {
-	vec2 e = b - a;
-	return (p.x - a.x) * e.y - (p.y - a.y) * e.x;
-}
-// Same cell as selection. Returns (distance to edge, 1 if inside cell else 0). One pass, no gap triangles.
-vec2 hex_edge_and_inside(vec2 world_xz, float size) {
-	vec2 axial = world_to_axial(world_xz, size);
-	vec3 r = cube_round(vec3(axial.x, -axial.x - axial.y, axial.y));
-	vec2 center = axial_to_center(vec2(r.x, r.z), size);
-	vec2 p = world_xz - center;
-	float k = size;
-	float c = 0.866025, s = 0.5;
-	vec2 v0 = k * vec2(0.0, 1.0), v1 = k * vec2(-c, s), v2 = k * vec2(-c, -s);
-	vec2 v3 = k * vec2(0.0, -1.0), v4 = k * vec2(c, -s), v5 = k * vec2(c, s);
-	float d0 = seg_dist(p, v0, v1), d1 = seg_dist(p, v1, v2), d2 = seg_dist(p, v2, v3);
-	float d3 = seg_dist(p, v3, v4), d4 = seg_dist(p, v4, v5), d5 = seg_dist(p, v5, v0);
-	float edge_d = min(min(min(d0, d1), min(d2, d3)), min(d4, d5));
-	float in0 = edge_side(p, v0, v1), in1 = edge_side(p, v1, v2), in2 = edge_side(p, v2, v3);
-	float in3 = edge_side(p, v3, v4), in4 = edge_side(p, v4, v5), in5 = edge_side(p, v5, v0);
-	float inside = (in0 >= 0.0 && in1 >= 0.0 && in2 >= 0.0 && in3 >= 0.0 && in4 >= 0.0 && in5 >= 0.0) ? 1.0 : 0.0;
-	return vec2(edge_d, inside);
+
+// Compute distance to nearest hex boundary in a tiling grid
+// Returns abs(signed distance) — always positive, 0 at boundary
+float hex_grid_distance(vec2 local_xz, float size) {
+	// Find which hex cell this pixel is in
+	vec2 axial = world_to_axial(local_xz, size);
+	vec3 cube = vec3(axial.x, -axial.x - axial.y, axial.y);
+	vec3 rounded = cube_round(cube);
+	vec2 center = axial_to_center(vec2(rounded.x, rounded.z), size);
+
+	// Local position relative to hex center
+	vec2 p = local_xz - center;
+
+	// Apothem = center to flat edge = size * sqrt(3) / 2
+	float apothem = size * 0.8660254;
+
+	// Distance to boundary (0 at edges, positive moving inward or outward)
+	return abs(hex_sdf(p, apothem));
 }
 
 void vertex() {
 	vec4 world_pos = MODEL_MATRIX * vec4(VERTEX, 1.0);
 	v_world_pos = world_pos.xyz;
+	v_local_xz = world_pos.xz - chunk_origin_xz;
 	v_elevation = world_pos.y;
 	v_world_normal = (MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz;
 }
@@ -138,7 +120,7 @@ void fragment() {
 			height_col = mix(low_col, height_col, blend);
 		}
 		float steep_mix = smoothstep(0.7, 0.5, n.y);
-		mesh_terrain_color = mix(height_col, COLOR_STEEP_ROCK, steep_mix);
+		mesh_terrain_color = mix(height_col, steep_rock_color, steep_mix);
 	}
 
 	float overview_blend = use_overview ? smoothstep(15000.0, 180000.0, altitude) : 0.0;
@@ -170,43 +152,20 @@ void fragment() {
 	float fog_factor = smoothstep(fog_start, fog_end_actual, dist);
 	base_col = mix(base_col, fog_color, fog_factor);
 
-	// TEMP: Unconditional red tint to verify this shader is on the visible terrain
-	base_col = mix(base_col, vec3(1.0, 0.0, 0.0), 0.3);
-
-	// === HEX GRID DIAGNOSTIC — TEMPORARY ===
-	float hex_line_mask = 0.0;
+	// Hex grid: SDF-based boundary distance, chunk-local for precision
 	float grid_mix = 0.0;
-	int hex_test = 1; // <-- CHANGE THIS NUMBER TO RUN DIFFERENT TESTS
-
 	if (show_hex_grid) {
-		vec2 edge_inside = hex_edge_and_inside(v_world_pos.xz, hex_size);
-		float d = edge_inside.x;
-		float inside = edge_inside.y;
-		float aa = fwidth(d) * hex_line_softness;
+		float bd = hex_grid_distance(v_local_xz, hex_size);
+		float aa = fwidth(bd) * hex_line_softness;
+		float line_mask = 1.0 - smoothstep(hex_line_width - aa, hex_line_width + aa, bd);
 
-		if (hex_test == 1) {
-			// TEST 1: Inside mask — red where inside==1, normal terrain where inside==0
-			if (inside > 0.5) {
-				base_col = vec3(1.0, 0.0, 0.0);
-			}
-		} else if (hex_test == 2) {
-			// TEST 2: Edge distance gradient — bright near edges, dark at cell centers
-			float d_viz = 1.0 - clamp(d / (hex_size * 0.5), 0.0, 1.0);
-			base_col = vec3(d_viz);
-		} else if (hex_test == 3) {
-			// TEST 3: Line mask — white lines where the smoothstep produces nonzero
-			hex_line_mask = (1.0 - smoothstep(hex_line_width - aa, hex_line_width + aa, d)) * inside;
-			base_col = vec3(hex_line_mask);
-		} else if (hex_test == 4) {
-			// TEST 4: fwidth — bright means fwidth(d) is large (bad), dark means small (good)
-			float fw = fwidth(d);
-			base_col = vec3(clamp(fw / 100.0, 0.0, 1.0));
-		} else if (hex_test == 5) {
-			// TEST 5: hex_size value — should be ~0.577 red if hex_size is correct (577.35/1000)
-			base_col = vec3(clamp(hex_size / 1000.0, 0.0, 1.0), 0.0, 0.0);
-		}
+		// Fade on steep slopes
+		line_mask *= smoothstep(0.35, 0.65, dot(n, vec3(0.0, 1.0, 0.0)));
+
+		grid_mix = min(line_mask * hex_grid_strength, 1.0);
+		base_col = mix(base_col, base_col * 0.55, grid_mix);
+		base_col = mix(base_col, hex_line_color, grid_mix * 0.7);
 	}
-	// === END DIAGNOSTIC ===
 
 	ALBEDO = min(base_col, vec3(1.5));
 	EMISSION = vec3(0.0);

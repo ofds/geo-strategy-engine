@@ -63,6 +63,14 @@ func _ready() -> void:
 	# Set default params (terrain only; hex overlay is screen-space compositor, not next_pass)
 	shader_material.set_shader_parameter("albedo", Color(0.3, 0.5, 0.2)) # Base green
 	shader_material.set_shader_parameter("roughness", 0.9)
+	# Elevation palette: single source of truth for terrain + Python overview pipeline
+	var palette_path: String = Constants.TERRAIN_DATA_PATH + "elevation_palette.png"
+	var palette_tex: Texture2D = load(palette_path) as Texture2D
+	if palette_tex:
+		shader_material.set_shader_parameter("elevation_palette", palette_tex)
+		shader_material.set_shader_parameter("max_elevation_m", terrain_metadata.get("max_elevation_m", max_elevation_m))
+	else:
+		push_error("TerrainLoader: Failed to load elevation palette texture: " + palette_path)
 	shader_material.next_pass = null
 
 	# Overview texture: same world extent as chunk grid (origin 0,0); used for continental color at high altitude
@@ -71,36 +79,31 @@ func _ready() -> void:
 	var overview_size_vec := Vector2.ZERO
 	if overview_path:
 		var tex_path: String = Constants.TERRAIN_DATA_PATH + overview_path
-		if FileAccess.file_exists(tex_path):
-			var img := Image.load_from_file(tex_path)
-			if img and not img.is_empty():
-				var tex := ImageTexture.create_from_image(img)
-				shader_material.set_shader_parameter("overview_texture", tex)
-				overview_origin_vec = Vector2.ZERO
-				# Always use chunk grid extent (same as ChunkManager overview plane) so macro view aligns
-				var mw: int = terrain_metadata.get("master_heightmap_width", 0)
-				var mh: int = terrain_metadata.get("master_heightmap_height", 0)
-				var grid_w: int = (mw + chunk_size_px - 1) / chunk_size_px
-				var grid_h: int = (mh + chunk_size_px - 1) / chunk_size_px
-				var ow: float = float(grid_w) * float(chunk_size_px) * resolution_m
-				var oh: float = float(grid_h) * float(chunk_size_px) * resolution_m
-				overview_size_vec = Vector2(ow, oh)
-				shader_material.set_shader_parameter("overview_origin", overview_origin_vec)
-				shader_material.set_shader_parameter("overview_size", overview_size_vec)
-				shader_material.set_shader_parameter("use_overview", true)
-				if OS.is_debug_build():
-					print("TerrainLoader: Overview texture loaded (%.0f x %.0f m, grid %dx%d)" % [ow, oh, grid_w, grid_h])
+		var tex: Texture2D = load(tex_path) as Texture2D
+		if tex:
+			shader_material.set_shader_parameter("overview_texture", tex)
+			overview_origin_vec = Vector2.ZERO
+			# Always use chunk grid extent (same as ChunkManager overview plane) so macro view aligns
+			var mw: int = terrain_metadata.get("master_heightmap_width", 0)
+			var mh: int = terrain_metadata.get("master_heightmap_height", 0)
+			var grid_w: int = (mw + chunk_size_px - 1) / chunk_size_px
+			var grid_h: int = (mh + chunk_size_px - 1) / chunk_size_px
+			var ow: float = float(grid_w) * float(chunk_size_px) * resolution_m
+			var oh: float = float(grid_h) * float(chunk_size_px) * resolution_m
+			overview_size_vec = Vector2(ow, oh)
+			shader_material.set_shader_parameter("overview_origin", overview_origin_vec)
+			shader_material.set_shader_parameter("overview_size", overview_size_vec)
+			shader_material.set_shader_parameter("use_overview", true)
+			if OS.is_debug_build():
+				print("TerrainLoader: Overview texture loaded (%.0f x %.0f m, grid %dx%d)" % [ow, oh, grid_w, grid_h])
 	if overview_size_vec == Vector2.ZERO:
 		shader_material.set_shader_parameter("use_overview", false)
 
 	shared_terrain_material = shader_material
-	print("[MAT-TRACE] shared_terrain_material shader path: ", shared_terrain_material.shader.resource_path if shared_terrain_material.shader else "NO SHADER")
-	print("[MAT-TRACE] shared_terrain_material instance ID: ", shared_terrain_material.get_instance_id())
 	# LOD 2+ material: same terrain, no next_pass (hex overlay is screen-space compositor for all LODs).
 	var mat_lod2plus: ShaderMaterial = shader_material.duplicate(true) as ShaderMaterial
 	mat_lod2plus.next_pass = null
 	shared_terrain_material_lod2plus = mat_lod2plus
-	print("[MAT-TRACE] shared_terrain_material_lod2plus shader: ", shared_terrain_material_lod2plus.shader.resource_path if shared_terrain_material_lod2plus and shared_terrain_material_lod2plus is ShaderMaterial and shared_terrain_material_lod2plus.shader else "NONE")
 	add_to_group("terrain_loader")
 	if OS.is_debug_build():
 		print("TerrainLoader: Unified terrain shader loaded (hex overlay via screen-space compositor).")
@@ -505,7 +508,7 @@ func _extract_heights_from_8bit(image: Image) -> Array[float]:
 	return heights
 
 
-func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, verbose: bool = true) -> ArrayMesh:
+func _generate_mesh_lod(heights: Array[float], _vertex_spacing: float, lod: int, verbose: bool = true) -> ArrayMesh:
 	"""
 	Generate a terrain mesh from height values with LOD-aware vertex spacing and decimation.
 	Higher LODs use fewer vertices (sample every Nth pixel).
@@ -595,7 +598,7 @@ func _generate_mesh_lod(heights: Array[float], vertex_spacing: float, lod: int, 
 	return mesh
 
 
-func _compute_normals_lod_decimated(heights: Array[float], actual_vertex_spacing: float, mesh_res: int, sample_stride: int, lod: int) -> PackedVector3Array:
+func _compute_normals_lod_decimated(heights: Array[float], actual_vertex_spacing: float, mesh_res: int, sample_stride: int, _lod: int) -> PackedVector3Array:
 	"""
 	Compute vertex normals for decimated mesh using sampled heightmap data.
 	actual_vertex_spacing is the world-space distance between adjacent vertices.
@@ -657,7 +660,7 @@ func _compute_normals_lod_decimated(heights: Array[float], actual_vertex_spacing
 	return normals
 
 
-func _create_heightmap_collision_lod(heights: Array[float], chunk_x: int, chunk_y: int, lod: int, world_x: float, world_z: float, vertex_spacing: float) -> CollisionShape3D:
+func _create_heightmap_collision_lod(heights: Array[float], chunk_x: int, chunk_y: int, lod: int, world_x: float, world_z: float, _vertex_spacing: float) -> CollisionShape3D:
 	"""
 	Create optimized HeightMapShape3D collision for this chunk with LOD-aware scaling and decimation.
 	CRITICAL: HeightMapShape3D must be positioned to exactly match the rendered mesh.
@@ -907,10 +910,6 @@ func finish_load_step_scene(computed_data: Dictionary, mesh: ArrayMesh, debug_co
 			mesh_instance.set_surface_override_material(0, shared_terrain_material)
 		else:
 			mesh_instance.set_surface_override_material(0, shared_terrain_material_lod2plus)
-	var surf_mat = mesh_instance.get_surface_override_material(0)
-	print("[MAT-TRACE] Chunk material shader: ", surf_mat.shader.resource_path if surf_mat is ShaderMaterial and surf_mat.shader else "NOT ShaderMaterial or no override")
-	print("[MAT-TRACE] Chunk material ID: ", surf_mat.get_instance_id() if surf_mat else "NO OVERRIDE")
-	print("[MAT-TRACE] Chunk surface material: ", mesh_instance.mesh.surface_get_material(0) if mesh_instance.mesh and mesh_instance.mesh.get_surface_count() > 0 else "NO SURFACE MATERIAL")
 	mesh_instance.position = world_pos
 	return mesh_instance
 

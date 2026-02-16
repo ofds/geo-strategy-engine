@@ -81,4 +81,16 @@ This means the **hex grid branch of the fragment shader is not affecting the fin
 - **Fix direction:** Either (1) use the terrain shader (or a compatible pass) for the overview plane so the same uniforms/hex logic apply, or (2) ensure chunk meshes are what the camera sees when testing (e.g. zoom in until LOD 0 chunks load and the overview is not dominant), or (3) change draw order / visibility so that at high altitude the chunks using the terrain shader are the visible surface.
 
 ---
+
+## Phase 2d: LOD 0 hex diagnostic tests (re-run)
+
+**Context:** The unconditional red tint is visible when zoomed in at LOD 0, so the terrain shader **is** active on the visible chunk meshes.
+
+**Result:** When zoomed in so that LOD 0 terrain is visible (red tint clearly on the ground), **the hex grid never appears**. This holds for:
+- All five diagnostic tests (hex_test 1 through 5): no red hex cells, no grayscale gradient, no white lines, no fwidth pattern, no solid ~0.577 red.
+- F1 toggle (grid on/off): no visible change; no hex grid at any zoom level where the red tint is visible.
+
+So the **hex branch** (`if (show_hex_grid)` and the test 1–5 visuals) is either **not running** (e.g. `show_hex_grid` is false in the shader at runtime despite camera setting it), or it runs but the **hex math / scale produces nothing visible** (e.g. wrong `hex_size`, wrong world units, or output overwritten/hidden). Next step: confirm `show_hex_grid` value in-shader (e.g. force a visible override when `show_hex_grid` is true) or audit hex_size / world_to_axial scale so the grid can appear.
+
+---
 *Temporary instrumentation (prints in terrain_loader, chunk_manager, basic_camera, and red tint in terrain.gdshader) left in place for the fix phase.*

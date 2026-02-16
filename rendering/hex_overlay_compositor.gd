@@ -187,8 +187,8 @@ func _render_callback(p_effect_callback_type: int, p_render_data: RenderData) ->
 		u2.binding = 2
 		u2.add_id(_params_buffer)
 		var uniform_set := UniformSetCacheRD.get_cache(_shader, 0, [u0, u1, u2])
-		var x_groups := int((size.x - 1) / 8) + 1
-		var y_groups := int((size.y - 1) / 8) + 1
+		var x_groups := ceili(float(size.x - 1) / 8.0)
+		var y_groups := ceili(float(size.y - 1) / 8.0)
 		var compute_list := _rd.compute_list_begin()
 		_rd.compute_list_bind_compute_pipeline(compute_list, _pipeline)
 		_rd.compute_list_bind_uniform_set(compute_list, uniform_set, 0)

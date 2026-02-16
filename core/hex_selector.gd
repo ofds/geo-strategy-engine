@@ -3,13 +3,12 @@ extends Node3D
 ## Independent of terrain LOD; uses ChunkManager.get_height_at() from height cache.
 ## Slice built with clipped rectangular grid (no polar grid) for correct hex shape.
 
-const SQRT3 := 1.73205080757
 const LIFT_TOP_M := 150.0
 const LIFT_DURATION_S := 0.3
 const WALL_DEPTH_M := 120.0  # 3x deeper for dramatic "chunk of earth" feel
 const OSCILLATION_AMP_M := 3.0
 const OSCILLATION_HZ := 1.0
-# Rectangular grid clipped to hex: step 50m, hex radius R = hex_size/sqrt(3)
+# Rectangular grid clipped to pointy-top hex; radius from Constants.HEX_RADIUS_M
 const GRID_STEP_M := 50.0
 const BOUNDARY_STEP_M := 25.0
 const HEIGHT_SAMPLE_WARN_RATIO := 0.2  # Warn if > 20% of samples return -1
@@ -50,63 +49,42 @@ func _process(delta: float) -> void:
 		smat.emission_energy_multiplier = 0.4
 
 
-## True if local point (lx, lz) is inside or on the flat-top hex (center at origin).
-func _is_inside_hex(lx: float, lz: float, hex_size: float) -> bool:
-	var size: float = hex_size / SQRT3
-	var q: float = (2.0 / 3.0 * lx) / size
-	var r: float = (-1.0 / 3.0 * lx + SQRT3 / 3.0 * lz) / size
-	var qr := _axial_round(Vector2(q, r))
-	return is_zero_approx(qr.x) and is_zero_approx(qr.y)
+## True if local point (lx, lz) is inside or on the pointy-top hex (center at origin, radius = center to vertex).
+## Use same boundary as _hex_row_intersection_x: flat edges at x = ±apothem, slanted caps at z = ±radius.
+## (Using the SDF with radius instead of apothem incorrectly included points out to ~±667 at z=0, giving a rectangular bbox.)
+func _is_inside_hex(lx: float, lz: float, radius: float) -> bool:
+	var row: PackedFloat32Array = _hex_row_intersection_x(lz, radius)
+	if row.size() < 2:
+		return false
+	return lx >= row[0] and lx <= row[1]
 
 
-func _axial_round(axial: Vector2) -> Vector2:
-	var rx: float = round(axial.x)
-	var ry: float = round(axial.y)
-	var rz: float = -rx - ry
-	var xd: float = abs(rx - axial.x)
-	var yd: float = abs(ry - axial.y)
-	var zd: float = abs(rz - (-axial.x - axial.y))
-	if xd > yd and xd > zd:
-		rx = -ry - rz
-	elif yd > zd:
-		ry = -rx - rz
+## Hex corners in local XZ (pointy-top: vertex at top, flat edges left/right). CCW from top.
+func _hex_corners_local(radius: float) -> PackedVector2Array:
+	var c: float = radius * 0.8660254  # cos(30°) = sqrt(3)/2
+	var s: float = radius * 0.5       # sin(30°) = 0.5
+	return PackedVector2Array([
+		Vector2(0.0, radius),   # top
+		Vector2(-c, s),         # upper-left
+		Vector2(-c, -s),       # lower-left
+		Vector2(0.0, -radius),  # bottom
+		Vector2(c, -s),        # lower-right
+		Vector2(c, s),         # upper-right
+	])
+
+
+## Intersection of line z = z_row with pointy-top hex boundary. Returns [left_x, right_x] or empty if no intersection.
+func _hex_row_intersection_x(z_row: float, radius: float) -> PackedFloat32Array:
+	var apothem: float = radius * 0.8660254  # sqrt(3)/2 * R = center to flat edge
+	var abs_z: float = abs(z_row)
+	if abs_z > radius:
+		return PackedFloat32Array()
+	var x_extent: float
+	if abs_z <= apothem:
+		x_extent = apothem
 	else:
-		rz = -rx - ry
-	return Vector2(rx, ry)
-
-
-## Hex corners in local XZ (flat-top). Order: right, top-right, top-left, left, bottom-left, bottom-right.
-func _hex_corners_local(hex_size: float) -> PackedVector2Array:
-	var corners: PackedVector2Array
-	corners.append(Vector2(hex_size * 0.5, 0.0))
-	corners.append(Vector2(hex_size * 0.25, hex_size * SQRT3 * 0.25))
-	corners.append(Vector2(-hex_size * 0.25, hex_size * SQRT3 * 0.25))
-	corners.append(Vector2(-hex_size * 0.5, 0.0))
-	corners.append(Vector2(-hex_size * 0.25, -hex_size * SQRT3 * 0.25))
-	corners.append(Vector2(hex_size * 0.25, -hex_size * SQRT3 * 0.25))
-	return corners
-
-
-## Intersection of line z = z_row with hex boundary. Returns [left_x, right_x] or empty if no intersection.
-func _hex_row_intersection_x(z_row: float, hex_size: float) -> PackedFloat32Array:
-	var corners: PackedVector2Array = _hex_corners_local(hex_size)
-	var xs: PackedFloat32Array = []
-	for e in range(6):
-		var p: Vector2 = corners[e]
-		var q: Vector2 = corners[(e + 1) % 6]
-		if abs(q.y - p.y) < 1e-6:
-			if abs(p.y - z_row) < 1e-6:
-				xs.append(p.x)
-				xs.append(q.x)
-			continue
-		var t: float = (z_row - p.y) / (q.y - p.y)
-		if t >= 0.0 and t <= 1.0:
-			var x: float = p.x + t * (q.x - p.x)
-			xs.append(x)
-	if xs.is_empty():
-		return xs
-	xs.sort()
-	return PackedFloat32Array([xs[0], xs[-1]])
+		x_extent = apothem * (radius - abs_z) / (radius - apothem)
+	return PackedFloat32Array([-x_extent, x_extent])
 
 
 ## Sample height at world XZ; return 0.0 if get_height_at returns -1 (not in cache).
@@ -133,8 +111,8 @@ func _terrain_color(elev: float) -> Color:
 
 ## Build ordered boundary vertices: walk 6 hex edges, step BOUNDARY_STEP_M, with terrain height.
 ## Returns array of Vector3 in local coords (x, height, z); also sets min_terrain_y.
-func _build_boundary_vertices(hex_size: float, min_terrain_y: float) -> Array:
-	var corners: PackedVector2Array = _hex_corners_local(hex_size)
+func _build_boundary_vertices(radius: float, min_terrain_y: float) -> Array:
+	var corners: PackedVector2Array = _hex_corners_local(radius)
 	var boundary: Array = []  # Vector3 local (x, y, z)
 	var failed_count: int = 0
 	var total_count: int = 0
@@ -166,26 +144,69 @@ func _build_boundary_vertices(hex_size: float, min_terrain_y: float) -> Array:
 
 
 func _build_slice_mesh() -> ArrayMesh:
-	var hex_size: float = Constants.HEX_SIZE_M
-	var R: float = hex_size / SQRT3  # hex "radius" (center to edge at 90°)
+	var radius: float = Constants.HEX_RADIUS_M  # pointy-top: center to vertex
 	var vertices := PackedVector3Array()
 	var colors := PackedColorArray()
 	var normals := PackedVector3Array()
 	var indices := PackedInt32Array()
 	var earth := Color(0.35, 0.25, 0.15)
+	var slice_dump: bool = OS.get_environment("SLICE_DUMP") == "1"
+
+	# --- [SLICE-DUMP] A) Selection center and radius (gate: SLICE_DUMP=1) ---
+	if slice_dump:
+		print("[SLICE-DUMP] Selected hex center (world XZ): (%.3f, %.3f)" % [_center_x, _center_z])
+		print("[SLICE-DUMP] Hex radius used: %.3f" % radius)
+
+	# --- [SLICE-DUMP] B) Hex corners (actual from _hex_corners_local) vs expected (terrain shader math) ---
+	var actual_corners: PackedVector2Array = _hex_corners_local(radius)
+	var hex_size: float = Constants.HEX_RADIUS_M
+	var c: float = hex_size * 0.8660254
+	var s: float = hex_size * 0.5
+	var expected_corners: Array = [
+		Vector2(0.0, hex_size),
+		Vector2(-c, s),
+		Vector2(-c, -s),
+		Vector2(0.0, -hex_size),
+		Vector2(c, -s),
+		Vector2(c, s),
+	]
+	if slice_dump:
+		for i in range(6):
+			var ac: Vector2 = actual_corners[i]
+			var ex: Vector2 = expected_corners[i]
+			var wx: float = _center_x + ac.x
+			var wz: float = _center_z + ac.y
+			print("[SLICE-DUMP] Corner %d (local): (%.3f, %.3f) -> (world): (%.3f, %.3f)  expected_local: (%.3f, %.3f)" % [i, ac.x, ac.y, wx, wz, ex.x, ex.y])
 
 	# --- Boundary vertices (ordered, for walls and rim) ---
 	var min_terrain_y: float = 0.0
-	var boundary_result: Array = _build_boundary_vertices(hex_size, 99999.0)
+	var boundary_result: Array = _build_boundary_vertices(radius, 99999.0)
 	var boundary_verts: Array = boundary_result[0]
 	min_terrain_y = boundary_result[1]
 	if min_terrain_y > 99998.0:
 		min_terrain_y = 0.0
 
+	# --- [SLICE-DUMP] D) Boundary vertices (first/last few) ---
+	var n_boundary: int = boundary_verts.size()
+	if slice_dump:
+		print("[SLICE-DUMP] Boundary vertex count: %d" % n_boundary)
+		for idx in range(mini(5, n_boundary)):
+			var bv: Vector3 = boundary_verts[idx]
+			print("[SLICE-DUMP] Boundary[%d]: Vector3(%.3f, %.3f, %.3f)" % [idx, bv.x, bv.y, bv.z])
+		if n_boundary > 10:
+			print("[SLICE-DUMP] ... (omitted %d) ..." % (n_boundary - 10))
+			for idx in range(n_boundary - 5, n_boundary):
+				var bv: Vector3 = boundary_verts[idx]
+				print("[SLICE-DUMP] Boundary[%d]: Vector3(%.3f, %.3f, %.3f)" % [idx, bv.x, bv.y, bv.z])
+		elif n_boundary > 5:
+			for idx in range(5, n_boundary):
+				var bv: Vector3 = boundary_verts[idx]
+				print("[SLICE-DUMP] Boundary[%d]: Vector3(%.3f, %.3f, %.3f)" % [idx, bv.x, bv.y, bv.z])
+
 	# --- Rectangular grid (snap outer points to hex boundary) ---
 	var step: float = GRID_STEP_M
-	var nx: int = maxi(2, int(ceil(2.0 * R / step)))
-	var nz: int = maxi(2, int(ceil(2.0 * R / step)))
+	var nx: int = maxi(2, int(ceil(2.0 * radius / step)))
+	var nz: int = maxi(2, int(ceil(2.0 * radius / step)))
 	# grid_vertex_index[i][j] = vertex index in arrays, or -1
 	var grid_vertex_index: Array = []
 	for j in range(nz):
@@ -203,22 +224,42 @@ func _build_slice_mesh() -> ArrayMesh:
 	if height_fallback <= 0.0:
 		height_fallback = min_terrain_y if min_terrain_y > 0.0 else 0.0
 
+	var apothem: float = radius * 0.8660254
 	var sample_fail_count: int = 0
 	var sample_total: int = 0
+	var dump_epsilon: float = 15.0
 	for j in range(nz):
-		var z_local: float = -R + (float(j) + 0.5) * step
-		var row_intersection: PackedFloat32Array = _hex_row_intersection_x(z_local, hex_size)
-		var left_x: float = -R
-		var right_x: float = R
+		var z_local: float = -radius + (float(j) + 0.5) * step
+		var row_intersection: PackedFloat32Array = _hex_row_intersection_x(z_local, radius)
+		var left_x: float = -radius
+		var right_x: float = radius
 		if row_intersection.size() >= 2:
 			left_x = row_intersection[0]
 			right_x = row_intersection[1]
 		# First pass: which columns in this row are inside the hex?
 		var valid_i: Array = []
 		for i in range(nx):
-			var x_center: float = -R + (float(i) + 0.5) * step
-			if _is_inside_hex(x_center, z_local, hex_size):
+			var x_center: float = -radius + (float(i) + 0.5) * step
+			if _is_inside_hex(x_center, z_local, radius):
 				valid_i.append(i)
+		# --- [SLICE-DUMP] E) Grid clipping samples: z=0, z near ±radius, z near ±apothem ---
+		if slice_dump:
+			var abs_z: float = abs(z_local)
+			var near_mid: bool = abs_z < dump_epsilon
+			var near_radius: bool = abs(abs_z - radius) < dump_epsilon
+			var near_apothem: bool = abs(abs_z - apothem) < dump_epsilon
+			if near_mid or near_radius or near_apothem:
+				var expected_x: float
+				if abs_z > radius:
+					expected_x = 0.0
+				elif abs_z <= apothem:
+					expected_x = apothem
+				else:
+					expected_x = apothem * (radius - abs_z) / (radius - apothem)
+				print("[SLICE-DUMP] Grid row z=%.1f: intersection_x range = [%.1f, %.1f] (expected for hex: [%.1f, %.1f])" % [z_local, left_x, right_x, -expected_x, expected_x])
+				var sample_lx: float = -radius + (float(nx) * 0.5 + 0.5) * step
+				var inside: bool = _is_inside_hex(sample_lx, z_local, radius)
+				print("[SLICE-DUMP] Grid point (lx, lz) = (%.1f, %.1f): is_inside = %s" % [sample_lx, z_local, inside])
 		if valid_i.is_empty():
 			continue
 		var i_min: int = valid_i[0]
@@ -229,7 +270,7 @@ func _build_slice_mesh() -> ArrayMesh:
 			if i > i_max:
 				i_max = i
 		for i in valid_i:
-			var x_center: float = -R + (float(i) + 0.5) * step
+			var x_center: float = -radius + (float(i) + 0.5) * step
 			var x_snap: float = left_x if i == i_min else (right_x if i == i_max else x_center)
 			var wx: float = _center_x + x_snap
 			var wz: float = _center_z + z_local
@@ -263,6 +304,8 @@ func _build_slice_mesh() -> ArrayMesh:
 	# --- Smooth normals for top surface ---
 	_compute_grid_normals(vertices, normals, indices, vertices.size())
 
+	var top_vertex_count: int = vertices.size()
+
 	# --- Side walls: consecutive boundary vertices, quad each (top L/R, bottom L/R). Bottom follows terrain (each vertex drops WALL_DEPTH_M from its surface height). ---
 	for k in range(boundary_verts.size()):
 		var next_k: int = (k + 1) % boundary_verts.size()
@@ -295,6 +338,23 @@ func _build_slice_mesh() -> ArrayMesh:
 		normals.append(out_n)
 		# Quad: top-left, bottom-left, bottom-right, top-right. CCW from outside (normal points out): two tris
 		indices.append_array([v0_top, v0_top + 1, v0_top + 3, v0_top, v0_top + 3, v0_top + 2])
+
+	# --- [SLICE-DUMP] F) Final mesh stats ---
+	var wall_vertex_count: int = vertices.size() - top_vertex_count
+	if slice_dump:
+		print("[SLICE-DUMP] Total top vertices: %d" % top_vertex_count)
+		print("[SLICE-DUMP] Total wall vertices: %d" % wall_vertex_count)
+		var vmin := Vector3(1e30, 1e30, 1e30)
+		var vmax := Vector3(-1e30, -1e30, -1e30)
+		for v in vertices:
+			vmin.x = minf(vmin.x, v.x)
+			vmin.y = minf(vmin.y, v.y)
+			vmin.z = minf(vmin.z, v.z)
+			vmax.x = maxf(vmax.x, v.x)
+			vmax.y = maxf(vmax.y, v.y)
+			vmax.z = maxf(vmax.z, v.z)
+		print("[SLICE-DUMP] Mesh bounding box: min(%.3f, %.3f, %.3f) to max(%.3f, %.3f, %.3f)" % [vmin.x, vmin.y, vmin.z, vmax.x, vmax.y, vmax.z])
+		print("[SLICE-DUMP] Slice node position (world offset): (%.3f, %.3f, %.3f)" % [_center_x, 0.0, _center_z])
 
 	# --- Single surface ---
 	var arrays: Array = []

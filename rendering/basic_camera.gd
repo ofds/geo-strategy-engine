@@ -117,6 +117,9 @@ func _ready() -> void:
 		print("Target: %s" % target_position)
 		print("Distance: %.1f m (%.1f km)" % [orbit_distance, orbit_distance / 1000.0])
 		print("Camera far plane: %.1f km" % (far / 1000.0))
+		# Phase 4d grid comparison: set env PHASE4D=1 and run to dump report to docs/PHASE_4D_GRID_COMPARISON_REPORT.md
+		if OS.get_environment("PHASE4D") == "1":
+			_run_phase_4d_grid_comparison()
 
 
 func _input(event: InputEvent) -> void:
@@ -152,6 +155,33 @@ func _input(event: InputEvent) -> void:
 			orbit_pitch = clamp(orbit_pitch, 10.0, 89.0)
 			
 			_update_camera_transform()
+## Hex center from raycast hit using chunk-local math (same as terrain shader). Returns world XZ center.
+func _hex_center_from_hit_chunk_local(hit_pos: Vector3) -> Vector2:
+	var chunk_origin: Vector2
+	var chunk_mgr = get_parent().get_node_or_null("ChunkManager")
+	if chunk_mgr and chunk_mgr.has_method("get_chunk_origin_at"):
+		chunk_origin = chunk_mgr.get_chunk_origin_at(hit_pos.x, hit_pos.z)
+	else:
+		# Fallback: LOD 0 cell origin so hex math still works
+		chunk_origin.x = floor(hit_pos.x / chunk_size_m) * chunk_size_m
+		chunk_origin.y = floor(hit_pos.z / chunk_size_m) * chunk_size_m
+
+	var local_x: float = hit_pos.x - chunk_origin.x
+	var local_z: float = hit_pos.z - chunk_origin.y
+	var hex_size: float = Constants.HEX_RADIUS_M  # pointy-top radius, same as shader
+
+	# world_to_axial in local space (same formulas as terrain.gdshader)
+	var q: float = (2.0 / 3.0 * local_x) / hex_size
+	var r: float = (-1.0 / 3.0 * local_x + sqrt(3.0) / 3.0 * local_z) / hex_size
+	# Shader cube order: (q, -q-r, r); axial = (rounded.x, rounded.z)
+	var cube: Vector3 = Vector3(q, -q - r, r)
+	var rounded: Vector3 = _cube_round_shader(cube)
+	# axial_to_center in local space (shader: axial_to_center(vec2(rounded.x, rounded.z), size))
+	var center_local_x: float = hex_size * (1.5 * rounded.x)
+	var center_local_z: float = hex_size * (sqrt(3.0) / 2.0 * rounded.x + sqrt(3.0) * rounded.z)
+	return Vector2(center_local_x + chunk_origin.x, center_local_z + chunk_origin.y)
+
+
 func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 	var space_state = get_world_3d().direct_space_state
 	var ray_origin = project_ray_origin(screen_pos)
@@ -173,19 +203,7 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 				return
 			_clear_zoom_in_message()
 
-		var width = Constants.HEX_SIZE_M
-		var hex_size = width / sqrt(3.0)
-
-		var q = (2.0 / 3.0 * hit_pos.x) / hex_size
-		var r = (-1.0 / 3.0 * hit_pos.x + sqrt(3.0) / 3.0 * hit_pos.z) / hex_size
-
-		var hex_axial = _axial_round(Vector2(q, r))
-		var hex_q = int(hex_axial.x)
-		var hex_r = int(hex_axial.y)
-
-		var center_x = hex_size * (3.0 / 2.0 * hex_q)
-		var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
-		var center = Vector2(center_x, center_z)
+		var center: Vector2 = _hex_center_from_hit_chunk_local(hit_pos)
 
 		var hex_selector = get_parent().get_node_or_null("HexSelector")
 		if _selected_hex_center.distance_to(center) < 1.0:
@@ -475,22 +493,11 @@ func _update_hex_grid_interaction() -> void:
 		if single:
 			terrain_materials.append(single)
 
-	if terrain_materials.size() > 0 and not _hex_trace_material_logged:
-		_hex_trace_material_logged = true
-		var tm = terrain_materials[0]
-		print("[HEX-TRACE] Camera terrain_material: ", tm, " shader: ", tm.shader.resource_path if tm is ShaderMaterial and tm.shader else "NONE")
-
 	if DEBUG_DIAGNOSTIC and OS.is_debug_build() and not _hex_diag_printed and _hex_compositor:
 		_hex_diag_printed = true
 		print("[HEX] Frame update: altitude=%.1f show_grid=%s (compositor)" % [alt_uniform, _hex_compositor.show_grid])
 
-	var _now_msec = Time.get_ticks_msec()
-	var _log_hex_set = (_now_msec - _hex_trace_last_set_msec >= 1000)
-	if _log_hex_set:
-		_hex_trace_last_set_msec = _now_msec
 	for terrain_material in terrain_materials:
-		if _log_hex_set:
-			print("[HEX-TRACE] Setting show_hex_grid = ", _grid_visible, " on material ID: ", terrain_material.get_instance_id() if terrain_material else 0)
 		terrain_material.set_shader_parameter("altitude", alt_uniform)
 		terrain_material.set_shader_parameter("camera_position", position)
 		terrain_material.set_shader_parameter("terrain_center_xz", _terrain_center_xz)
@@ -511,7 +518,6 @@ func _update_hex_grid_interaction() -> void:
 	if Input.is_key_pressed(KEY_F1):
 		if not _f1_pressed_last_frame:
 			_grid_visible = not _grid_visible
-			print("[HEX-TRACE] F1 pressed. _grid_visible is now: ", _grid_visible)
 			for terrain_material in terrain_materials:
 				terrain_material.set_shader_parameter("show_hex_grid", _grid_visible)
 			if _hex_compositor:
@@ -548,20 +554,17 @@ func _update_hex_grid_interaction() -> void:
 
 			if result:
 				var hit_pos = result.position
-				var width = Constants.HEX_SIZE_M
-				var hex_size = width / sqrt(3.0)
-				var q = (2.0 / 3.0 * hit_pos.x) / hex_size
-				var r = (-1.0 / 3.0 * hit_pos.x + sqrt(3.0) / 3.0 * hit_pos.z) / hex_size
-				var hex_axial = _axial_round(Vector2(q, r))
-				var hex_q = int(hex_axial.x)
-				var hex_r = int(hex_axial.y)
-				var center_x = hex_size * (3.0 / 2.0 * hex_q)
-				var center_z = hex_size * (sqrt(3.0) / 2.0 * hex_q + sqrt(3.0) * hex_r)
-				_hovered_hex_center = Vector2(center_x, center_z)
+				var center: Vector2 = _hex_center_from_hit_chunk_local(hit_pos)
+				_hovered_hex_center = center
 				if _hex_compositor:
 					_hex_compositor.hovered_hex_center = _hovered_hex_center
-				_update_debug_visuals(hit_pos, Vector3(center_x, hit_pos.y, center_z))
-				_update_debug_label(hex_q, hex_r)
+				_update_debug_visuals(hit_pos, Vector3(center.x, hit_pos.y, center.y))
+				# Axial (q,r) for debug label from center (same convention as shader)
+				var hex_size: float = Constants.HEX_RADIUS_M
+				var q: float = (2.0 / 3.0 * center.x) / hex_size
+				var r: float = (-1.0 / 3.0 * center.x + sqrt(3.0) / 3.0 * center.y) / hex_size
+				var hex_axial = _axial_round(Vector2(q, r))
+				_update_debug_label(int(hex_axial.x), int(hex_axial.y))
 			else:
 				_hide_debug_label()
 				_hovered_hex_center = Vector2(-999999.0, -999999.0)
@@ -613,6 +616,14 @@ func _update_hex_grid_interaction() -> void:
 		else:
 			_f6_pressed_last_frame = false
 
+		# F7: Phase 4d grid comparison (selection vs shader hex grid)
+		if Input.is_key_pressed(KEY_F7):
+			if not _f7_pressed_last_frame and OS.is_debug_build():
+				_run_phase_4d_grid_comparison()
+				_f7_pressed_last_frame = true
+		else:
+			_f7_pressed_last_frame = false
+
 
 var _grid_visible: bool = Constants.GRID_DEFAULT_VISIBLE
 var _f1_pressed_last_frame: bool = false
@@ -620,11 +631,10 @@ var _f2_pressed_last_frame: bool = false
 var _f3_pressed_last_frame: bool = false
 var _f4_pressed_last_frame: bool = false
 var _f6_pressed_last_frame: bool = false
+var _f7_pressed_last_frame: bool = false
 var _debug_label: Label = null
 var _selection_label: Label = null
 var _hex_diag_printed: bool = false
-var _hex_trace_material_logged: bool = false
-var _hex_trace_last_set_msec: int = 0
 
 
 func _find_chunk_recursive(node: Node) -> MeshInstance3D:
@@ -659,6 +669,144 @@ func _cube_round(cube: Vector3) -> Vector2:
 		rz = - rx - ry
 	
 	return Vector2(rx, ry)
+
+
+## Returns full cube after round (for Phase 4d shader comparison: shader uses .x and .z as axial).
+func _cube_round_shader(cube: Vector3) -> Vector3:
+	var rx = round(cube.x)
+	var ry = round(cube.y)
+	var rz = round(cube.z)
+	var x_diff = abs(rx - cube.x)
+	var y_diff = abs(ry - cube.y)
+	var z_diff = abs(rz - cube.z)
+	if x_diff > y_diff and x_diff > z_diff:
+		rx = -ry - rz
+	elif y_diff > z_diff:
+		ry = -rx - rz
+	else:
+		rz = -rx - ry
+	return Vector3(rx, ry, rz)
+
+
+## Phase 4d: Compare selection hex grid vs terrain shader hex grid (same world point → same center?).
+## Call from F7. Writes docs/PHASE_4D_GRID_COMPARISON_REPORT.md. Verbose [GRID-CMP]/[SDF-CHECK] only if PHASE4D_VERBOSE=1.
+func _run_phase_4d_grid_comparison() -> void:
+	var hex_size: float = Constants.HEX_SIZE_M / sqrt(3.0)  # 577.35
+	var chunk_world_size_lod0: float = float(Constants.CHUNK_SIZE_PX) * Constants.RESOLUTION_M  # 46080
+	var verbose: bool = OS.get_environment("PHASE4D_VERBOSE") == "1"
+
+	var report_lines: PackedStringArray = PackedStringArray()
+	report_lines.append("## Phase 4d: Grid Comparison Results (Phase 4e: both methods use chunk-local)")
+	report_lines.append("")
+	report_lines.append("### Center comparison (Method A vs Method B)")
+	report_lines.append("")
+
+	# Test points: Phase 4c selection centers + a couple non-center points
+	var test_points: Array[Vector2] = [
+		Vector2(3077854.250, 1944000.000),
+		Vector2(3076122.250, 1944000.000),
+		Vector2(3077854.250 + 100.0, 1944000.000 + 50.0),
+		Vector2(3078000.0, 1944100.0),
+	]
+
+	for wp in test_points:
+		var world_x: float = wp.x
+		var world_z: float = wp.y
+
+		# Chunk origin at LOD 0 (chunk corner = origin for shader)
+		var chunk_ox: float = floor(world_x / chunk_world_size_lod0) * chunk_world_size_lod0
+		var chunk_oz: float = floor(world_z / chunk_world_size_lod0) * chunk_world_size_lod0
+		var local_x: float = world_x - chunk_ox
+		var local_z: float = world_z - chunk_oz
+
+		# --- Method A: Selection (chunk-local, same as Phase 4e — cube = (q, -q-r, r), axial = (rounded.x, rounded.z)) ---
+		var q_a: float = (2.0 / 3.0 * local_x) / hex_size
+		var r_a: float = (-1.0 / 3.0 * local_x + sqrt(3.0) / 3.0 * local_z) / hex_size
+		var cube_a: Vector3 = Vector3(q_a, -q_a - r_a, r_a)
+		var rounded_a_vec: Vector3 = _cube_round_shader(cube_a)
+		var aq: float = rounded_a_vec.x
+		var ar: float = rounded_a_vec.z
+		var center_local_a_x: float = hex_size * (1.5 * aq)
+		var center_local_a_z: float = hex_size * (sqrt(3.0) / 2.0 * aq + sqrt(3.0) * ar)
+		var center_a_x: float = center_local_a_x + chunk_ox
+		var center_a_z: float = center_local_a_z + chunk_oz
+
+		# --- Method B: Shader (chunk-local, cube = (q, -q-r, r), axial = (rounded.x, rounded.z)) ---
+		var q_b: float = (2.0 / 3.0 * local_x) / hex_size
+		var r_b: float = (-1.0 / 3.0 * local_x + sqrt(3.0) / 3.0 * local_z) / hex_size
+		var cube_b: Vector3 = Vector3(q_b, -q_b - r_b, r_b)
+		var rounded_b_vec: Vector3 = _cube_round_shader(cube_b)
+		var bq: float = rounded_b_vec.x
+		var br: float = rounded_b_vec.z
+		var center_local_x: float = hex_size * (1.5 * bq)
+		var center_local_z: float = hex_size * (sqrt(3.0) / 2.0 * bq + sqrt(3.0) * br)
+		var center_b_x: float = center_local_x + chunk_ox
+		var center_b_z: float = center_local_z + chunk_oz
+
+		var match_yes: bool = abs(center_a_x - center_b_x) < 0.01 and abs(center_a_z - center_b_z) < 0.01
+		var dx: float = center_a_x - center_b_x
+		var dz: float = center_a_z - center_b_z
+
+		if verbose:
+			var prefix: String = "[GRID-CMP] "
+			print(prefix + "World point: (%.3f, %.3f)" % [world_x, world_z])
+			print(prefix + "Chunk origin: (%.3f, %.3f)" % [chunk_ox, chunk_oz])
+			print(prefix + "Method A (chunk-local) — local_xz: (%.3f, %.3f), axial: (%.0f, %.0f), center: (%.3f, %.3f)" % [local_x, local_z, aq, ar, center_a_x, center_a_z])
+			print(prefix + "Method B (shader) — same local, axial: (%.0f, %.0f), center: (%.3f, %.3f)" % [bq, br, center_b_x, center_b_z])
+			print(prefix + "MATCH: %s  Offset: (%.6f, %.6f) m" % [("yes" if match_yes else "no"), dx, dz])
+			print("")
+
+		report_lines.append("- World (%.3f, %.3f) -> A center (%.3f, %.3f), B center (%.3f, %.3f), MATCH: %s, offset (%.6f, %.6f) m" % [world_x, world_z, center_a_x, center_a_z, center_b_x, center_b_z, ("yes" if match_yes else "no"), dx, dz])
+
+	# --- SDF orientation check (must match terrain.gdshader hex_sdf: pointy-top formula) ---
+	var radius: float = 577.35
+	var apothem: float = radius * 0.8660254
+	var p_top: Vector2 = Vector2(0.0, radius)
+	var p_right: Vector2 = Vector2(apothem, 0.0)
+	var p_abs = p_top.abs()
+	# Shader: max(dot(abs(p), vec2(0.5, 0.8660254)), p.x) - apothem (pointy-top: 0 at vertex and flat edge)
+	var sdf_top: float = maxf(p_abs.x * 0.5 + p_abs.y * 0.8660254, p_abs.x) - apothem
+	p_abs = p_right.abs()
+	var sdf_right: float = maxf(p_abs.x * 0.5 + p_abs.y * 0.8660254, p_abs.x) - apothem
+
+	if verbose:
+		print("[SDF-CHECK] SDF at top vertex (0, 577.35): ", sdf_top, " (should be ~0 for pointy-top)")
+		print("[SDF-CHECK] SDF at right edge (500, 0): ", sdf_right, " (should be ~0 for pointy-top)")
+	report_lines.append("")
+	report_lines.append("### SDF orientation check")
+	report_lines.append("")
+	report_lines.append("- SDF at top vertex (0, 577.35): %s (should be ~0 if boundary passes through vertex)" % str(sdf_top))
+	report_lines.append("- SDF at right edge (500, 0): %s (should be ~0 if boundary passes through flat edge)" % str(sdf_right))
+	report_lines.append("")
+
+	# Axis trace (terrain shader uses pointy-top: vertices at (0, ±radius), flat at (±apothem, 0))
+	report_lines.append("### Axis trace")
+	report_lines.append("")
+	report_lines.append("axial_to_center returns (world_x_component, world_z_component). local_xz = (local_x, local_z). p = local_xz - center = (dx, dz).")
+	report_lines.append("hex_sdf (pointy-top): max(dot(abs(p), vec2(0.5, 0.8660254)), abs(p).x) - apothem => 0 at vertex (0, radius) and flat edge (apothem, 0).")
+	report_lines.append("")
+
+	# Conclusion
+	report_lines.append("### Conclusion")
+	report_lines.append("")
+	if abs(sdf_top) > 1.0:
+		report_lines.append("The SDF boundary does NOT pass through the hex vertices (sdf_top != 0). The terrain shader SDF is oriented for flat-top (flat at top/bottom) while axial/selection use pointy-top (vertex at top). Fix: use pointy-top SDF formula.")
+	else:
+		report_lines.append("SDF orientation matches pointy-top.")
+	report_lines.append("")
+
+	var report_path: String = "res://docs/PHASE_4D_GRID_COMPARISON_REPORT.md"
+	var dir: String = report_path.get_base_dir()
+	if not DirAccess.dir_exists_absolute(dir):
+		DirAccess.make_dir_recursive_absolute(dir)
+	var f: FileAccess = FileAccess.open(report_path, FileAccess.WRITE)
+	if f:
+		f.store_string("\n".join(report_lines))
+		f.close()
+		if OS.is_debug_build():
+			print("[Phase 4d] Report written to ", report_path)
+	else:
+		push_error("Phase 4d: Could not write report to " + report_path)
 
 
 func _update_debug_label(q: int, r: int) -> void:

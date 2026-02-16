@@ -161,14 +161,10 @@ func _setup_overview_plane() -> void:
 		return
 	var terrain_path: String = Constants.TERRAIN_DATA_PATH
 	var tex_path: String = terrain_path + meta.overview_texture
-	if not FileAccess.file_exists(tex_path):
-		push_warning("ChunkManager: Overview texture not found: " + tex_path)
+	var tex: Texture2D = load(tex_path) as Texture2D
+	if not tex:
+		push_warning("ChunkManager: Overview texture not found or not imported: " + tex_path)
 		return
-	var img: Image = Image.load_from_file(tex_path)
-	if not img or img.is_empty():
-		push_warning("ChunkManager: Failed to load overview image")
-		return
-	var tex = ImageTexture.create_from_image(img)
 	# Use same extent as chunk grid (LOD0 grid × 512 × resolution) so macro view aligns with chunks
 	const CHUNK_PX: int = 512
 	var overview_w: float = float(_lod0_grid.x * CHUNK_PX) * _resolution_m
@@ -567,10 +563,9 @@ func _do_one_phase_b_step() -> void:
 		if mesh != null:
 			var mesh_instance = terrain_loader.finish_load_step_scene(computed, mesh, false)
 			if mesh_instance:
-				var override_mat = mesh_instance.get_surface_override_material(0)
-				print("[MAT-TRACE] Chunk material shader: ", override_mat.shader.resource_path if override_mat is ShaderMaterial and override_mat and override_mat.shader else "NOT ShaderMaterial or no override")
-				print("[MAT-TRACE] Chunk material ID: ", override_mat.get_instance_id() if override_mat else "NO OVERRIDE")
-				print("[MAT-TRACE] Chunk surface material: ", mesh_instance.mesh.surface_get_material(0) if mesh_instance.mesh and mesh_instance.mesh.get_surface_count() > 0 else "NO SURFACE MATERIAL")
+				# Chunk origin for SDF hex grid (chunk-local coords in shader for float precision)
+				var world_pos: Vector3 = computed["world_pos"]
+				mesh_instance.set_instance_shader_parameter("chunk_origin_xz", Vector2(world_pos.x, world_pos.z))
 				mesh_instance.add_to_group("terrain_chunks") # So camera finds shared material without recursive search
 				mesh_instance.scale = Vector3(0.97, 0.97, 0.97)
 				chunks_container.add_child(mesh_instance)
@@ -1270,6 +1265,20 @@ func _get_max_concurrent_loads() -> int:
 	if load_queue.size() > LARGE_QUEUE_THRESHOLD:
 		return MAX_CONCURRENT_ASYNC_LOADS_LARGE
 	return MAX_CONCURRENT_ASYNC_LOADS_BASE
+
+
+## Returns the origin (NW corner XZ) of the chunk containing the given world position.
+## Used by selection to do hex math in chunk-local space (same as terrain shader). Single source of truth.
+func get_chunk_origin_at(world_x: float, world_z: float) -> Vector2:
+	var lod: int = get_lod_at_world_position(Vector3(world_x, 0.0, world_z))
+	var cell_size: float = 512.0 * _resolution_m
+	if lod < 0:
+		# Not in any loaded chunk (e.g. overview plane); use LOD 0 cell so hex math still works
+		return Vector2(floor(world_x / cell_size) * cell_size, floor(world_z / cell_size) * cell_size)
+	var chunk_size: float = _get_chunk_world_size(lod)
+	var cx: int = int(floor(world_x / chunk_size))
+	var cy: int = int(floor(world_z / chunk_size))
+	return Vector2(cx * chunk_size, cy * chunk_size)
 
 
 ## Returns the LOD of the chunk that contains the given world position (XZ).

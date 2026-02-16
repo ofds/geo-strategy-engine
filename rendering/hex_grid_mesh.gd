@@ -7,8 +7,9 @@ const SQRT3 := 1.73205080757
 const DECAL_WORLD_SIZE := 20000.0
 
 @export var hex_size: float = 1000.0
-var _show_grid_backing: bool = true
-@export var show_grid: bool = true:
+## When false, decal is hidden so terrain shader is the only grid source (avoids yellow decal artifacts).
+var _show_grid_backing: bool = false
+@export var show_grid: bool = false:
 	get:
 		return _show_grid_backing
 	set(value):

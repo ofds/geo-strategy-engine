@@ -61,6 +61,9 @@ const MEMORY_BUDGET_BYTES: int = 2147483648 # 2 GB for terrain chunks
 const HEX_SIZE_M: float = 1000.0 # Flat-top hex width (flat edge to flat edge)
 const HEX_WIDTH_M: float = 1000.0 # Same as HEX_SIZE_M
 const HEX_HEIGHT_M: float = 866.025 # Flat-top hex height (width * sqrt(3)/2)
+## Pointy-top radius: center to vertex = HEX_SIZE_M / sqrt(3)
+## This is the "size" parameter used by terrain shader (hex_size uniform) and selection math.
+const HEX_RADIUS_M: float = HEX_SIZE_M / sqrt(3.0)  # ≈ 577.35
 const HEX_VERTICES: int = 7 # Center + 6 corners
 
 

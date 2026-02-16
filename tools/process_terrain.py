@@ -43,14 +43,54 @@ LOD_LEVELS = 5
 TILE_OVERLAP_PX = 10  # Overlap zone for blending
 SEA_LEVEL_UINT16 = 1000  # Sea level (0m) maps to this in PNG so water is distinguishable
 
+# Water color for overview (land colors come from elevation_palette.png)
+COLOR_WATER_OVERVIEW = (38, 64, 115)
+
+
+def load_elevation_palette(path: Path) -> Optional[np.ndarray]:
+    """Load elevation_palette.png (256×1 or 1×256 RGB) and return (256, 3) float 0-1, or None if missing."""
+    if not path.exists():
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            img = Image.open(path)
+        arr = np.array(img)
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        h, w = arr.shape[0], arr.shape[1]
+        if h == 1 and w >= 256:
+            row = arr[0, :256, :3].astype(np.float64) / 255.0
+        elif w == 1 and h >= 256:
+            row = arr[:256, 0, :3].astype(np.float64) / 255.0
+        else:
+            return None
+        return row
+    except Exception:
+        return None
+
+
+def sample_elevation_color(elevation_m: np.ndarray, palette: np.ndarray, max_elev: float = 10000.0) -> np.ndarray:
+    """Sample elevation palette at given elevations (meters). Returns (N, 3) uint8 RGB.
+    Matches shader: t = clamp(elev/max_elev, 0, 1), sample at (t, 0.5). Linear interpolation along palette."""
+    t = np.clip(elevation_m.astype(np.float64) / max_elev, 0.0, 1.0)
+    n = palette.shape[0]
+    idx_float = t * (n - 1)
+    idx0 = np.clip(np.floor(idx_float).astype(int), 0, n - 1)
+    idx1 = np.clip(idx0 + 1, 0, n - 1)
+    frac = idx_float - np.floor(idx_float)
+    rgb_float = (1.0 - frac)[:, np.newaxis] * palette[idx0] + frac[:, np.newaxis] * palette[idx1]
+    return np.clip(np.round(rgb_float * 255.0), 0, 255).astype(np.uint8)
+
 
 class TerrainProcessor:
     """Main terrain processing pipeline."""
     
-    def __init__(self, region_config: Dict, output_dir: Path, cache_dir: Path):
+    def __init__(self, region_config: Dict, output_dir: Path, cache_dir: Path, skip_cells: bool = False):
         self.region_config = region_config
         self.output_dir = output_dir
         self.cache_dir = cache_dir
+        self.skip_cells = skip_cells
         self.bbox = region_config['bounding_box']
         self.max_elevation_m = region_config['max_elevation_m']
         # SRTM3: use SRTM1 tiles, downsample each tile during merge (90m grid, ~5.5GB not 50GB)
@@ -120,6 +160,13 @@ class TerrainProcessor:
         # Step 7: Generate metadata
         print("\n[7/7] Generating metadata...")
         self._generate_metadata(normalized.shape, chunks_info, overview_info)
+        
+        # Step 8: Generate cell textures (Phase 1A) — optional
+        if not getattr(self, 'skip_cells', False):
+            print("\n[8/8] Generating cell ID textures (LOD 0–2)...")
+            self._generate_cell_textures()
+        else:
+            print("\n[8/8] Skipping cell texture generation (--skip-cells).")
         
         # Summary
         elapsed = time.time() - start_time
@@ -626,62 +673,22 @@ class TerrainProcessor:
         overview_world_width_m = grid_w * CHUNK_SIZE_PX * self.resolution_m
         overview_world_height_m = grid_h * CHUNK_SIZE_PX * self.resolution_m
 
-        # Elevation zone colors (RGB 0-255) matching terrain.gdshader
-        COLOR_WATER = (38, 64, 115)
-        COLOR_COASTAL_LOW = (41, 74, 28)   # 0-50m slightly darker
-        COLOR_PLAINS = (46, 82, 31)        # 50-150m standard = COLOR_LOWLAND
-        COLOR_LOW_HILLS = (51, 87, 33)     # 150-300m slightly lighter
-        COLOR_LOWLAND = (46, 82, 31)       # <300m
-        COLOR_FOOTHILLS = (64, 107, 38)   # 300-800m
-        COLOR_ALPINE = (89, 122, 46)       # 800-1500m
-        COLOR_ROCK = (115, 97, 77)         # 1500-2200m
-        COLOR_HIGH_ROCK = (158, 153, 148)  # 2200-3000m
-        COLOR_SNOW = (235, 237, 242)       # >3000m
-        TRANSITION_M = 200.0
-        LOW_ELEV_BLEND_M = 50.0
-
-        def blend_t(boundary: float, e: np.ndarray) -> np.ndarray:
-            t = (e - (boundary - TRANSITION_M)) / (2.0 * TRANSITION_M)
-            return np.clip(t, 0.0, 1.0)
-
-        def blend_low(boundary: float, e: np.ndarray) -> np.ndarray:
-            t = (e - (boundary - LOW_ELEV_BLEND_M)) / (2.0 * LOW_ELEV_BLEND_M)
-            return np.clip(t, 0.0, 1.0)
-
+        # Elevation colors from shared palette (single source of truth with shader)
+        palette = load_elevation_palette(self.output_dir / "elevation_palette.png")
+        max_elev = float(self.max_elevation_m)
         rgb = np.zeros((overview_height, overview_width, 3), dtype=np.uint8)
         water_mask = elev_m < 5  # Match shader WATER_ELEVATION_M = 5.0
-        rgb[water_mask] = COLOR_WATER
+        rgb[water_mask] = COLOR_WATER_OVERVIEW
 
         land = ~water_mask
-        # Low-elev micro-detail (0-50, 50-150, 150-300) then blend to standard bands at 200-400m
-        t50 = blend_low(50.0, elev_m)
-        t150 = blend_low(150.0, elev_m)
-        t300 = blend_t(300.0, elev_m)
-        t800 = blend_t(800.0, elev_m)
-        t1500 = blend_t(1500.0, elev_m)
-        t2200 = blend_t(2200.0, elev_m)
-        t3000 = blend_t(3000.0, elev_m)
-        low_elev_blend = np.clip((elev_m - 200.0) / 200.0, 0.0, 1.0)  # 200-400m blend to standard
-
-        for c in range(3):
-            c_coast = np.where(land, np.float32(COLOR_COASTAL_LOW[c]), 0.0)
-            c_plains = np.where(land, np.float32(COLOR_PLAINS[c]), 0.0)
-            c_lowh = np.where(land, np.float32(COLOR_LOW_HILLS[c]), 0.0)
-            c_low = np.where(land, np.float32(COLOR_LOWLAND[c]), 0.0)
-            c_foot = np.where(land, np.float32(COLOR_FOOTHILLS[c]), 0.0)
-            c_alp = np.where(land, np.float32(COLOR_ALPINE[c]), 0.0)
-            c_rock = np.where(land, np.float32(COLOR_ROCK[c]), 0.0)
-            c_high = np.where(land, np.float32(COLOR_HIGH_ROCK[c]), 0.0)
-            c_snow = np.where(land, np.float32(COLOR_SNOW[c]), 0.0)
-            low_band = c_coast * (1 - t50) + c_plains * t50
-            low_band = low_band * (1 - t150) + c_lowh * t150
-            out_c = low_band * (1 - low_elev_blend) + c_low * low_elev_blend
-            out_c = out_c * (1 - t300) + c_foot * t300
-            out_c = out_c * (1 - t800) + c_alp * t800
-            out_c = out_c * (1 - t1500) + c_rock * t1500
-            out_c = out_c * (1 - t2200) + c_high * t2200
-            out_c = out_c * (1 - t3000) + c_snow * t3000
-            rgb[land, c] = np.clip(np.round(out_c[land]), 0, 255).astype(np.uint8)
+        if palette is not None and np.any(land):
+            land_elev = elev_m[land]
+            land_rgb = sample_elevation_color(land_elev, palette, max_elev)
+            rgb[land] = land_rgb
+        else:
+            if palette is None:
+                print("  [WARN] elevation_palette.png not found; run tools/generate_elevation_palette.py first. Using fallback green.")
+            rgb[land] = (46, 82, 31)  # Fallback lowland green
 
         out_path = self.output_dir / "overview_texture.png"
         img = Image.fromarray(rgb)
@@ -722,6 +729,26 @@ class TerrainProcessor:
             json.dump(metadata, f, indent=2)
         
         print(f"  [OK] Saved: {metadata_path}")
+
+    def _generate_cell_textures(self) -> None:
+        """Phase 1A: Generate cell ID textures and cell_metadata.json (LOD 0–2)."""
+        try:
+            from generate_cell_textures import run_generation
+        except ImportError:
+            # Run from repo root or tools/
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from generate_cell_textures import run_generation
+        metadata_path = self.output_dir / "terrain_metadata.json"
+        total_chunks, total_cells, elapsed = run_generation(
+            metadata_path,
+            self.output_dir,
+            lods=[0, 1, 2],
+            workers=1,
+            verify=False,
+            debug_viz=False,
+        )
+        print(f"  [OK] Generated {total_chunks} cell textures, {total_cells} cells, in {elapsed:.1f}s")
+        print(f"  [OK] Saved: {self.output_dir / 'cell_metadata.json'}")
 
 
 def main():
@@ -764,6 +791,11 @@ def main():
         action='store_true',
         help='Only generate overview texture from existing master_heightmap.png and update metadata (skip download/merge/chunk).',
     )
+    parser.add_argument(
+        '--skip-cells',
+        action='store_true',
+        help='Skip Phase 1A cell texture generation (chunk_*_cells.png and cell_metadata.json).',
+    )
     
     args = parser.parse_args()
     
@@ -784,7 +816,7 @@ def main():
     region_config = regions_data['regions'][args.region]
     
     # Run processor
-    processor = TerrainProcessor(region_config, args.output, args.cache)
+    processor = TerrainProcessor(region_config, args.output, args.cache, skip_cells=args.skip_cells)
     
     try:
         if args.overview_only:
