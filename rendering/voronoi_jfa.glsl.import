@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dxud56bm2nykr"
+path="res://.godot/imported/voronoi_jfa.glsl-79bb332b52d7586ddfa4281be4e6316f.res"
+
+[deps]
+
+source_file="res://rendering/voronoi_jfa.glsl"
+dest_files=["res://.godot/imported/voronoi_jfa.glsl-79bb332b52d7586ddfa4281be4e6316f.res"]
+
+[params]
+

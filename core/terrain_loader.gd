@@ -34,6 +34,17 @@ var _height_cache_order: Array = []
 const CELL_TEXTURE_CACHE_MAX: int = 200
 var _cell_texture_cache: Dictionary = {}
 var _cell_texture_cache_order: Array = []
+# Phase 2A: Distance field texture cache (same key pattern as cell texture).
+const DISTANCE_TEXTURE_CACHE_MAX: int = 200
+var _distance_texture_cache: Dictionary = {}
+var _distance_texture_cache_order: Array = []
+
+# GPU distance field generator (Phase 2A GPU). Set cell_metadata from ChunkManager after it loads.
+var cell_metadata: Dictionary = {}
+var _distance_field_generator: DistanceFieldGenerator = null
+# Cap GPU generations per frame to avoid 200ms+ Phase B spikes (spread cost across frames).
+const MAX_GPU_DISTANCE_GENERATIONS_PER_FRAME: int = 2
+var _gpu_distance_generations_this_frame: int = 0
 
 # Phase B micro-steps: MESH -> SCENE -> COLLISION (each step can run on a different frame)
 enum PhaseBStep { MESH, SCENE, COLLISION }
@@ -110,6 +121,7 @@ func _ready() -> void:
 	mat_lod2plus.next_pass = null
 	shared_terrain_material_lod2plus = mat_lod2plus
 	add_to_group("terrain_loader")
+	_distance_field_generator = DistanceFieldGenerator.new()
 	if OS.is_debug_build():
 		print("TerrainLoader: Unified terrain shader loaded (hex overlay via screen-space compositor).")
 
@@ -171,13 +183,18 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 		debug_material.cull_mode = BaseMaterial3D.CULL_DISABLED
 		mesh_instance.set_surface_override_material(0, debug_material)
 	else:
-		# Phase 1B: per-chunk cell texture. Instance shader params for sampler2D are not applied in Godot 4,
-		# so we use a material duplicate per chunk with cell_id_texture set on the material.
+		# Phase 1B: per-chunk cell texture. Phase 2A: distance field for shape-agnostic grid.
 		var cell_tex: Texture2D = _load_cell_texture(chunk_x, chunk_y, lod)
+		var distance_tex: Texture2D = _load_distance_field_texture(chunk_x, chunk_y, lod)
 		if lod <= 1:
 			if cell_tex:
 				var mat: ShaderMaterial = shared_terrain_material.duplicate() as ShaderMaterial
 				mat.set_shader_parameter("cell_id_texture", cell_tex)
+				if distance_tex:
+					mat.set_shader_parameter("boundary_distance_texture", distance_tex)
+					mat.set_shader_parameter("has_distance_field", true)
+				else:
+					mat.set_shader_parameter("has_distance_field", false)
 				mesh_instance.set_surface_override_material(0, mat)
 			else:
 				mesh_instance.set_surface_override_material(0, shared_terrain_material)
@@ -185,6 +202,11 @@ func load_chunk(chunk_x: int, chunk_y: int, lod: int, collision_body: StaticBody
 			if cell_tex:
 				var mat: ShaderMaterial = shared_terrain_material_lod2plus.duplicate() as ShaderMaterial
 				mat.set_shader_parameter("cell_id_texture", cell_tex)
+				if distance_tex:
+					mat.set_shader_parameter("boundary_distance_texture", distance_tex)
+					mat.set_shader_parameter("has_distance_field", true)
+				else:
+					mat.set_shader_parameter("has_distance_field", false)
 				mesh_instance.set_surface_override_material(0, mat)
 			else:
 				mesh_instance.set_surface_override_material(0, shared_terrain_material_lod2plus)
@@ -243,6 +265,110 @@ func _load_cell_texture(chunk_x: int, chunk_y: int, lod: int) -> Texture2D:
 	_cell_texture_cache[cache_key] = tex
 	_cell_texture_cache_order.append(cache_key)
 	return tex
+
+
+## Load boundary distance field texture (Phase 2A). Path: data/terrain/cells/lod{L}/chunk_{x}_{y}_distance.png
+## LOD 0-2 only; LOD 3+ returns null. Uses FIFO cache. If file missing, generates on GPU (hybrid).
+func _load_distance_field_texture(chunk_x: int, chunk_y: int, lod: int) -> Texture2D:
+	if lod > 2:
+		return null
+	var cache_key: String = "lod%d_%d_%d" % [lod, chunk_x, chunk_y]
+	if _distance_texture_cache.has(cache_key):
+		return _distance_texture_cache[cache_key]
+	var path: String = "res://data/terrain/cells/lod%d/chunk_%d_%d_distance.png" % [lod, chunk_x, chunk_y]
+	if FileAccess.file_exists(path):
+		var tex: Texture2D = load(path) as Texture2D
+		if tex:
+			_cache_distance_texture(cache_key, tex)
+			return tex
+	# Generate on GPU (file missing or development iteration), capped per frame to avoid Phase B spikes
+	if _gpu_distance_generations_this_frame >= MAX_GPU_DISTANCE_GENERATIONS_PER_FRAME:
+		if OS.is_debug_build():
+			push_warning("TerrainLoader: GPU distance cap reached (%d/frame), chunk (%d, %d, LOD %d) will use fallback grid." % [MAX_GPU_DISTANCE_GENERATIONS_PER_FRAME, chunk_x, chunk_y, lod])
+		return null
+	if OS.is_debug_build():
+		print("TerrainLoader: Generating distance field on GPU for chunk (%d, %d, LOD %d)" % [chunk_x, chunk_y, lod])
+	_gpu_distance_generations_this_frame += 1
+	var generated_tex: Texture2D = _generate_distance_field_gpu(chunk_x, chunk_y, lod)
+	if generated_tex:
+		_cache_distance_texture(cache_key, generated_tex)
+		return generated_tex
+	if OS.is_debug_build():
+		push_warning("TerrainLoader: No distance field for chunk (%d, %d, LOD %d)" % [chunk_x, chunk_y, lod])
+	return null
+
+
+func _cache_distance_texture(cache_key: String, tex: Texture2D) -> void:
+	if _distance_texture_cache.size() >= DISTANCE_TEXTURE_CACHE_MAX and _distance_texture_cache_order.size() > 0:
+		var oldest: String = _distance_texture_cache_order.pop_front()
+		_distance_texture_cache.erase(oldest)
+	_distance_texture_cache[cache_key] = tex
+	_distance_texture_cache_order.append(cache_key)
+
+
+func _generate_distance_field_gpu(chunk_x: int, chunk_y: int, lod: int) -> Texture2D:
+	if not _distance_field_generator:
+		push_error("TerrainLoader: DistanceFieldGenerator not initialized.")
+		return null
+	var cell_tex: Texture2D = _load_cell_texture(chunk_x, chunk_y, lod)
+	if not cell_tex:
+		if OS.is_debug_build():
+			push_warning("TerrainLoader: Cannot generate distance field without cell texture.")
+		return null
+	var cell_centers: Array = _extract_cell_centers_for_chunk(cell_tex, chunk_x, chunk_y, lod)
+	if cell_centers.is_empty():
+		if OS.is_debug_build():
+			push_warning("TerrainLoader: No cell centers for chunk (%d, %d, LOD %d); metadata may be unloaded." % [chunk_x, chunk_y, lod])
+		return null
+	var lod_scale: int = 1 << lod
+	var world_chunk_size: float = float(chunk_size_px) * resolution_m * float(lod_scale)
+	var chunk_origin: Vector2 = Vector2(float(chunk_x) * world_chunk_size, float(chunk_y) * world_chunk_size)
+	var hex_radius: float = Constants.HEX_RADIUS_M
+	var t0: int = Time.get_ticks_usec()
+	var distance_tex: Texture2D = _distance_field_generator.generate(cell_tex, cell_centers, chunk_origin, world_chunk_size, hex_radius)
+	var elapsed_ms: float = (Time.get_ticks_usec() - t0) / 1000.0
+	# Always log timing when generating (performance verification)
+	print("  GPU distance field: %.2f ms, %d cells" % [elapsed_ms, cell_centers.size()])
+	return distance_tex
+
+
+## Extract unique cell IDs and their centers from a chunk's cell texture (for GPU distance field).
+func _extract_cell_centers_for_chunk(cell_texture: Texture2D, _chunk_x: int, _chunk_y: int, _lod: int) -> Array:
+	var img: Image = cell_texture.get_image()
+	if not img:
+		return []
+	var width: int = img.get_width()
+	var height: int = img.get_height()
+	var unique_ids: Dictionary = {}
+	for y in range(height):
+		for x in range(width):
+			var cell_id: int = _decode_cell_id_from_color(img.get_pixel(x, y))
+			if cell_id > 0:
+				unique_ids[cell_id] = true
+	var cell_centers: Array = []
+	for cid in unique_ids.keys():
+		if not cell_metadata.has(cid):
+			continue
+		var center: Vector2 = _get_cell_center(cid)
+		cell_centers.append({"cell_id": cid, "center_x": center.x, "center_z": center.y})
+	return cell_centers
+
+
+## Decode cell ID from RGBA pixel (matches Python encoding).
+func _decode_cell_id_from_color(color: Color) -> int:
+	var r: int = int(round(color.r * 255.0))
+	var g: int = int(round(color.g * 255.0))
+	var b: int = int(round(color.b * 255.0))
+	var a: int = int(round(color.a * 255.0))
+	return r * 16777216 + g * 65536 + b * 256 + a
+
+
+## Get cell center from cell_metadata (set by ChunkManager). Returns Vector2(center_x, center_z).
+func _get_cell_center(cell_id: int) -> Vector2:
+	if not cell_metadata.has(cell_id):
+		return Vector2.ZERO
+	var entry: Dictionary = cell_metadata[cell_id]
+	return Vector2(entry.get("center_x", 0.0), entry.get("center_z", 0.0))
 
 
 func _chunk_to_world_position(chunk_x: int, chunk_y: int, lod: int) -> Vector3:
@@ -971,12 +1097,18 @@ func finish_load_step_scene(computed_data: Dictionary, mesh: ArrayMesh, debug_co
 		debug_material.cull_mode = BaseMaterial3D.CULL_DISABLED
 		mesh_instance.set_surface_override_material(0, debug_material)
 	else:
-		# Phase 1B: per-chunk cell texture on material duplicate (instance sampler param not applied in Godot 4)
+		# Phase 1B: per-chunk cell texture. Phase 2A: distance field texture.
 		var cell_tex: Texture2D = _load_cell_texture(chunk_x, chunk_y, lod)
+		var distance_tex: Texture2D = _load_distance_field_texture(chunk_x, chunk_y, lod)
 		if lod <= 1:
 			if cell_tex:
 				var mat: ShaderMaterial = shared_terrain_material.duplicate() as ShaderMaterial
 				mat.set_shader_parameter("cell_id_texture", cell_tex)
+				if distance_tex:
+					mat.set_shader_parameter("boundary_distance_texture", distance_tex)
+					mat.set_shader_parameter("has_distance_field", true)
+				else:
+					mat.set_shader_parameter("has_distance_field", false)
 				mesh_instance.set_surface_override_material(0, mat)
 			else:
 				mesh_instance.set_surface_override_material(0, shared_terrain_material)
@@ -984,6 +1116,11 @@ func finish_load_step_scene(computed_data: Dictionary, mesh: ArrayMesh, debug_co
 			if cell_tex:
 				var mat: ShaderMaterial = shared_terrain_material_lod2plus.duplicate() as ShaderMaterial
 				mat.set_shader_parameter("cell_id_texture", cell_tex)
+				if distance_tex:
+					mat.set_shader_parameter("boundary_distance_texture", distance_tex)
+					mat.set_shader_parameter("has_distance_field", true)
+				else:
+					mat.set_shader_parameter("has_distance_field", false)
 				mesh_instance.set_surface_override_material(0, mat)
 			else:
 				mesh_instance.set_surface_override_material(0, shared_terrain_material_lod2plus)

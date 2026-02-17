@@ -132,12 +132,14 @@ const HEX_SELECTION_MAX_LOD: int = 2
 ## TerrainLoader names collision shapes "HeightMap_LOD%d_%d_%d"; prefix for parsing hit shape.
 const HEIGHTMAP_COLLISION_NAME_PREFIX: String = "HeightMap"
 const HEIGHTMAP_COLLISION_LOD_PREFIX: String = "LOD"
-## Sentinel: no hex selected (center far out of bounds). Compare with SELECTION_SENTINEL_THRESHOLD.
-const SELECTION_SENTINEL_NO_HEX: float = 999999.0
-## If selected_hex_center.x < this, treat as "has selection" (avoids float compare with sentinel).
-const SELECTION_SENTINEL_THRESHOLD: float = 900000.0
+## Sentinel: no hex selected (center far out of bounds). Must be above any valid world X (e.g. Europe 0..6e6 m).
+const SELECTION_SENTINEL_NO_HEX: float = 999999999.0
+## If selected_hex_center.x < this, treat as "has selection" (compositor/camera). Must be > valid world coords.
+const SELECTION_SENTINEL_THRESHOLD: float = 999999999.0
 ## Click within this distance (m) of current selection to deselect.
 const SELECTION_SAME_HEX_DISTANCE_M: float = 1.0
+## Max distance (m) from cell center to allow selection; beyond this treat as miss (constrain selection to hex).
+const SELECTION_MAX_DISTANCE_FROM_CENTER_M: float = HEX_RADIUS_M * 0.8660254  # apothem: center to flat edge
 ## Hover sentinel: no hex under cursor (for compositor/labels).
 const HOVER_SENTINEL_NO_HEX: float = -999999.0
 

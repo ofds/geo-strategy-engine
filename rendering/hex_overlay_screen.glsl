@@ -33,7 +33,7 @@ const float CUTOUT_MARGIN_M = 15.0;
 const float GRID_FADE_START = 5000.0;
 const float GRID_FADE_END = 20000.0;
 const float HOVER_SENTINEL = -999990.0;
-const float SELECT_SENTINEL = 900000.0;
+const float SELECT_SENTINEL = 999999999.0;  // Above any valid world X (e.g. Europe 0..6e6 m)
 
 vec2 world_to_axial(vec2 pos, float width) {
 	float size = width / SQRT_3;

@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://chmav78jgi0fc"
+path="res://.godot/imported/voronoi_distance_field.glsl-06f0e788af7354733c661a7e14e1afb0.res"
+
+[deps]
+
+source_file="res://rendering/voronoi_distance_field.glsl"
+dest_files=["res://.godot/imported/voronoi_distance_field.glsl-06f0e788af7354733c661a7e14e1afb0.res"]
+
+[params]
+

@@ -124,7 +124,9 @@ func _ready() -> void:
 	
 	# Phase 1C: Load cell metadata once for texture-based selection (cell_id -> center, axial, neighbors).
 	_load_cell_metadata()
-	
+	# Share metadata with TerrainLoader for GPU distance field generation (cell centers per chunk).
+	terrain_loader.cell_metadata = cell_metadata
+
 	# Continental overview plane (instant, gap-free at high zoom) - add first so chunks render on top
 	_setup_overview_plane()
 	
@@ -295,6 +297,9 @@ func _process(delta: float) -> void:
 	if _exiting:
 		return
 	_process_frame_start_msec = Time.get_ticks_msec()
+	# Reset GPU distance field cap so Phase B (this frame) gets a fresh count (max 2 generations/frame).
+	if terrain_loader:
+		terrain_loader._gpu_distance_generations_this_frame = 0
 	# During initial load: only drive async load and progress; no streaming yet
 	if initial_load_in_progress:
 		_process_initial_load()
@@ -1332,6 +1337,12 @@ func _get_max_concurrent_loads() -> int:
 	return MAX_CONCURRENT_ASYNC_LOADS_BASE
 
 
+## Project 3D world position to 2D cell space (Phase 1D). Cell identity is determined by XZ only.
+## Flat mode: vertical projection (drop Y). Future sphere mode would use lat/lon.
+func project_to_cell_space(world_pos: Vector3) -> Vector2:
+	return Vector2(world_pos.x, world_pos.z)
+
+
 ## Returns the origin (NW corner XZ) of the chunk containing the given world position.
 ## Used by selection to do hex math in chunk-local space (same as terrain shader). Single source of truth.
 func get_chunk_origin_at(world_x: float, world_z: float) -> Vector2:
@@ -1410,13 +1421,18 @@ func _get_cell_id_at_chunk_impl(world_pos: Vector3, cx: int, cy: int, hit_lod: i
 	var local_x: float = world_pos.x - chunk_origin_x
 	var local_z: float = world_pos.z - chunk_origin_z
 	# Use chunk_size so texture sampling matches terrain mesh UV: mesh UV 0..1 = 0..chunk_world_size.
+	# Phase 1E: pixel-extent convention — pixel i owns [i/w*cs, (i+1)/w*cs). floor(local/cs * w) then clamp.
 	var img: Image = tex.get_image()
 	if img == null or img.is_empty():
 		return 0
 	var w: int = img.get_width()
 	var h: int = img.get_height()
-	var px: int = clampi(int(round(local_x / chunk_size * float(w - 1))), 0, w - 1)
-	var py: int = clampi(int(round(local_z / chunk_size * float(h - 1))), 0, h - 1)
+	var px_raw: int = clampi(int(floor(local_x / chunk_size * float(w))), 0, w - 1)
+	var py_raw: int = clampi(int(floor(local_z / chunk_size * float(h))), 0, h - 1)
+	# If selection is shifted in Z, try flipping V: Godot may load texture with row 0 at bottom (set constant true to test).
+	const CELL_TEXTURE_V_FLIP: bool = false
+	var py: int = (h - 1 - py_raw) if CELL_TEXTURE_V_FLIP else py_raw
+	var px: int = px_raw
 	var color: Color = img.get_pixel(px, py)
 	return _decode_cell_id_rgba(color)
 
@@ -1524,3 +1540,74 @@ func get_diagnostic_snapshot() -> Dictionary:
 
 func has_initial_load_completed() -> bool:
 	return initial_load_complete
+
+
+## Phase 1D: Run selection offset test (20 samples). Uses visible LOD + 2D projection.
+## Samples only from loaded LOD 0-2 chunks (cell textures exist) so we get valid samples.
+## Returns { min_offset, max_offset, mean_offset, std_offset, offsets, elevations, pass }.
+func run_selection_offset_test(num_samples: int = 20) -> Dictionary:
+	var offsets: Array[float] = []
+	var elevations: Array[float] = []
+	var cell_size: float = float(Constants.CHUNK_SIZE_PX) * _resolution_m
+	# Collect loaded chunks at LOD 0-2 only (have cell textures)
+	var sample_chunks: Array = []
+	for key in loaded_chunks.keys():
+		var i = loaded_chunks[key]
+		if i.lod < 0 or i.lod > Constants.HEX_SELECTION_MAX_LOD:
+			continue
+		var cs: float = cell_size * float(int(pow(2, i.lod)))
+		var world_x: float = float(i.x) * cs
+		var world_z: float = float(i.y) * cs
+		sample_chunks.append({"x": world_x, "z": world_z, "lod": i.lod, "cx": i.x, "cy": i.y, "chunk_size": cs})
+	if sample_chunks.is_empty():
+		return {"min_offset": -1.0, "max_offset": -1.0, "mean_offset": -1.0, "std_offset": -1.0, "pass": false, "n": 0}
+	for i in range(num_samples):
+		var chunk = sample_chunks[randi() % sample_chunks.size()]
+		var cs: float = chunk.chunk_size
+		# Point inside chunk (avoid exact edges)
+		var x: float = chunk.x + randf_range(cs * 0.2, cs * 0.8)
+		var z: float = chunk.z + randf_range(cs * 0.2, cs * 0.8)
+		var y: float = 0.0
+		var h: float = get_height_at(x, z)
+		if h >= 0.0:
+			y = h
+		var hit_lod: int = chunk.lod
+		var cx: int = chunk.cx
+		var cy: int = chunk.cy
+		var pos_2d: Vector3 = Vector3(x, 0.0, z)
+		var cell_id: int = get_cell_id_at_chunk(pos_2d, cx, cy, hit_lod)
+		if cell_id <= 0:
+			continue
+		var center_analytical: Vector2 = get_hex_center_at_lod(pos_2d, hit_lod)
+		var center_meta: Vector2 = center_analytical
+		var info_dict: Dictionary = get_cell_info(cell_id)
+		if not info_dict.is_empty():
+			center_meta = Vector2(info_dict.center_x, info_dict.center_z)
+		var offset_m: float = center_meta.distance_to(center_analytical)
+		offsets.append(offset_m)
+		elevations.append(y)
+	if offsets.is_empty():
+		return {"min_offset": -1.0, "max_offset": -1.0, "mean_offset": -1.0, "std_offset": -1.0, "pass": false, "n": 0}
+	var sum_o: float = 0.0
+	var min_o: float = 1e9
+	var max_o: float = -1e9
+	for o in offsets:
+		sum_o += o
+		min_o = minf(min_o, o)
+		max_o = maxf(max_o, o)
+	var mean_o: float = sum_o / float(offsets.size())
+	var var_sum: float = 0.0
+	for o in offsets:
+		var_sum += (o - mean_o) * (o - mean_o)
+	var std_o: float = sqrt(var_sum / float(offsets.size())) if offsets.size() > 1 else 0.0
+	var pass_test: bool = max_o < 10.0 and std_o < 5.0
+	return {
+		"min_offset": min_o,
+		"max_offset": max_o,
+		"mean_offset": mean_o,
+		"std_offset": std_o,
+		"offsets": offsets,
+		"elevations": elevations,
+		"n": offsets.size(),
+		"pass": pass_test
+	}

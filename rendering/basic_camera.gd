@@ -29,8 +29,11 @@ var frame_count: int = 0
 # Height pipeline diagnostic: when true, print [SHADER] altitude/overview_blend once per second (enable with ChunkManager DEBUG_DIAGNOSTIC for full pipeline)
 @export var DEBUG_DIAGNOSTIC: bool = false
 var _shader_diag_timer: float = 0.0
-# Diagnostic: use analytical hex center for slice instead of metadata (compare alignment with grid)
+# Diagnostic: if true, use analytical hex center for slice instead of metadata (for comparison).
 @export var USE_ANALYTICAL_FOR_TEST: bool = false
+# When true, position slice at texture grid cell center (pixel center) so it aligns with the drawn grid; when false use metadata or analytical.
+@export var USE_GRID_CELL_CENTER_FOR_SLICE: bool = true
+const CELL_TEXTURE_SIZE: int = 512  # Match cell texture resolution (Phase 1E)
 
 # Speed boost
 var speed_boost_multiplier: float = 10.0 # 10x speed when Space is held
@@ -195,41 +198,31 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 	var result = space_state.intersect_ray(query)
 
 	if result:
-		var hit_pos = result.position
+		var hit_pos: Vector3 = result.position
 
 		var chunk_mgr = get_parent().get_node_or_null("ChunkManager")
+		# Base LOD from visible chunks; we may override with hit shape so we sample the exact chunk we hit.
 		var hit_lod: int = chunk_mgr.get_lod_at_world_position(hit_pos) if chunk_mgr else -1
 		if hit_lod > Constants.HEX_SELECTION_MAX_LOD:
 			_show_zoom_in_to_select_message()
 			return
 		_clear_zoom_in_message()
 
-		# Resolve the exact chunk we hit (from collision shape name) so we sample the same texture as the visible grid.
-		var hit_chunk_lod: int = hit_lod
-		var hit_chunk_x: int = -1
-		var hit_chunk_y: int = -1
-		if result.get("collider") != null and result.get("shape") != null:
-			var body: Node = result.collider as Node
-			var shape_idx: int = result.shape
-			if body != null and shape_idx >= 0 and shape_idx < body.get_child_count():
-				var shape_node: Node = body.get_child(shape_idx)
-				var parts: PackedStringArray = shape_node.name.split("_")
-				var min_parts: int = 4  # "HeightMap_LOD0_66_42"
-				if parts.size() >= min_parts and parts[0] == Constants.HEIGHTMAP_COLLISION_NAME_PREFIX and parts[1].begins_with(Constants.HEIGHTMAP_COLLISION_LOD_PREFIX):
-					hit_chunk_lod = int(parts[1].trim_prefix(Constants.HEIGHTMAP_COLLISION_LOD_PREFIX))
-					hit_chunk_x = int(parts[2])
-					hit_chunk_y = int(parts[3])
-					if hit_chunk_lod >= 0 and hit_chunk_lod <= Constants.HEX_SELECTION_MAX_LOD and hit_chunk_x >= 0 and hit_chunk_y >= 0:
-						hit_lod = hit_chunk_lod
+		# Project to 2D cell space immediately (cell identity is XZ only).
+		var cell_xz: Vector2 = chunk_mgr.project_to_cell_space(hit_pos) if chunk_mgr else Vector2(hit_pos.x, hit_pos.z)
 
-		# Phase 1C: Use hit chunk (from shape) so selection matches visible grid (same texture, extent, origin).
+		# Always use visible LOD (finest loaded at this point) for selection so we sample the same texture as the drawn grid.
+		# Using the hit collider's LOD can sample a coarser/hidden chunk when multiple LODs have collision and the ray hits the wrong one.
+		var chunk_size: float = chunk_size_m * float(1 << hit_lod)
+		var sel_cx: int = int(floor(cell_xz.x / chunk_size))
+		var sel_cy: int = int(floor(cell_xz.y / chunk_size))
+		# Pass position with Y=0 so cell lookup uses only XZ (projection layer).
+		var pos_2d: Vector3 = Vector3(cell_xz.x, 0.0, cell_xz.y)
+
 		var center: Vector2
 		var cell_id: int = 0
 		if chunk_mgr != null:
-			if hit_chunk_x >= 0 and hit_chunk_y >= 0 and hit_chunk_lod >= 0 and hit_chunk_lod <= Constants.HEX_SELECTION_MAX_LOD:
-				cell_id = chunk_mgr.get_cell_id_at_chunk(hit_pos, hit_chunk_x, hit_chunk_y, hit_chunk_lod)
-			else:
-				cell_id = chunk_mgr.get_cell_id_at_position(hit_pos, hit_lod)
+			cell_id = chunk_mgr.get_cell_id_at_chunk(pos_2d, sel_cx, sel_cy, hit_lod)
 		if cell_id > 0:
 			var info: Dictionary = chunk_mgr.get_cell_info(cell_id) if chunk_mgr else {}
 			if not info.is_empty():
@@ -245,44 +238,50 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 			_selected_cell_id = 0
 			return
 
-		# Analytical center (chunk-local hex math) for diagnostic comparison
-		var analytical_center: Vector2 = chunk_mgr.get_hex_center_at_lod(hit_pos, hit_lod) if chunk_mgr and chunk_mgr.has_method("get_hex_center_at_lod") else Vector2.ZERO
-		var world_center: Vector2 = analytical_center if USE_ANALYTICAL_FOR_TEST else center
+		var chunk_origin: Vector2 = Vector2(float(sel_cx) * chunk_size, float(sel_cy) * chunk_size)
+		var local_pos: Vector2 = Vector2(cell_xz.x - chunk_origin.x, cell_xz.y - chunk_origin.y)
 
-		# Quick diagnostic: print selection flow coordinates (coordinate space mismatch check)
-		var chunk_size: float = chunk_size_m * float(1 << hit_lod)
-		var chunk_origin: Vector2
-		var chunk_x: int
-		var chunk_y: int
-		if hit_chunk_x >= 0 and hit_chunk_y >= 0:
-			chunk_origin = Vector2(float(hit_chunk_x) * chunk_size, float(hit_chunk_y) * chunk_size)
-			chunk_x = hit_chunk_x
-			chunk_y = hit_chunk_y
+		# Slice center: grid cell (pixel center) aligns with texture-drawn grid; analytical/metadata can offset.
+		var analytical_center: Vector2 = chunk_mgr.get_hex_center_at_lod(pos_2d, hit_lod) if chunk_mgr and chunk_mgr.has_method("get_hex_center_at_lod") else Vector2.ZERO
+		var world_center: Vector2
+		if USE_GRID_CELL_CENTER_FOR_SLICE:
+			# Phase 1E: same pixel convention as shader (floor(local/cs*512)); center of that pixel in world
+			var px: int = clampi(int(floor(local_pos.x / chunk_size * float(CELL_TEXTURE_SIZE))), 0, CELL_TEXTURE_SIZE - 1)
+			var py: int = clampi(int(floor(local_pos.y / chunk_size * float(CELL_TEXTURE_SIZE))), 0, CELL_TEXTURE_SIZE - 1)
+			world_center = chunk_origin + Vector2((float(px) + 0.5) / float(CELL_TEXTURE_SIZE) * chunk_size, (float(py) + 0.5) / float(CELL_TEXTURE_SIZE) * chunk_size)
+		elif USE_ANALYTICAL_FOR_TEST:
+			world_center = analytical_center
 		else:
-			chunk_origin = chunk_mgr.get_chunk_origin_at(hit_pos.x, hit_pos.z) if chunk_mgr else Vector2.ZERO
-			chunk_x = int(floor(hit_pos.x / chunk_size))
-			chunk_y = int(floor(hit_pos.z / chunk_size))
-		var local_pos: Vector2 = Vector2(hit_pos.x - chunk_origin.x, hit_pos.z - chunk_origin.y)
+			world_center = center
+
 		var cell_center_world_xz: Vector2 = Vector2(center.x, center.y)
 		if DEBUG_DIAGNOSTIC and OS.is_debug_build():
-			print("\n=== SELECTION DEBUG ===")
-			print("Raycast hit position (world): ", hit_pos)
-			print("Hit chunk LOD: ", hit_lod)
-			print("Hit chunk indices: (", chunk_x, ", ", chunk_y, ")")
+			print("\n=== SELECTION DEBUG (Phase 1D: visible LOD + 2D projection) ===")
+			print("Raycast hit position (world 3D): ", hit_pos)
+			print("Projected cell XZ (2D): ", cell_xz)
+			print("Visible LOD: ", hit_lod)
+			print("Chunk indices at visible LOD: (", sel_cx, ", ", sel_cy, ")")
 			print("Chunk origin (world): ", chunk_origin)
-			print("Local position: ", local_pos)
+			print("Local position (2D): ", local_pos)
 			print("Cell ID: ", cell_id)
 			print("Cell center from metadata (world XZ): ", cell_center_world_xz)
 			print("Cell center from analytical (world XZ): ", analytical_center)
 			print("Difference (metadata - analytical): ", Vector2(center.x - analytical_center.x, center.y - analytical_center.y))
-			print("Center passed to hex_selector: ", world_center, " (analytical)" if USE_ANALYTICAL_FOR_TEST else " (metadata)")
+			var slice_src: String = "grid_cell" if USE_GRID_CELL_CENTER_FOR_SLICE else ("analytical" if USE_ANALYTICAL_FOR_TEST else "metadata")
+			print("Center passed to hex_selector: ", world_center, " (", slice_src, ")")
 			print("======================\n")
 
-		if USE_ANALYTICAL_FOR_TEST and DEBUG_DIAGNOSTIC and OS.is_debug_build():
-			print(">>> USING ANALYTICAL CENTER FOR SLICE <<<")
-
+		# Constrain selection: only select if click is within hex (distance from hit to cell center <= apothem)
+		var hit_xz: Vector2 = Vector2(cell_xz.x, cell_xz.y)
+		var dist_to_center: float = hit_xz.distance_to(world_center)
 		var hex_selector = get_parent().get_node_or_null("HexSelector")
-		if _selected_hex_center.distance_to(world_center) < Constants.SELECTION_SAME_HEX_DISTANCE_M:
+		if dist_to_center > Constants.SELECTION_MAX_DISTANCE_FROM_CENTER_M:
+			# Click too far from cell center (e.g. chunk gap, or wrong cell) — treat as miss
+			_selected_hex_center = Vector2(Constants.SELECTION_SENTINEL_NO_HEX, Constants.SELECTION_SENTINEL_NO_HEX)
+			_selected_cell_id = 0
+			if hex_selector and hex_selector.has_method("clear_selection"):
+				hex_selector.clear_selection()
+		elif _selected_hex_center.distance_to(world_center) < Constants.SELECTION_SAME_HEX_DISTANCE_M:
 			_selected_hex_center = Vector2(Constants.SELECTION_SENTINEL_NO_HEX, Constants.SELECTION_SENTINEL_NO_HEX)
 			_selected_cell_id = 0
 			if hex_selector and hex_selector.has_method("clear_selection"):
@@ -292,10 +291,16 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 			_selection_time = 0.0
 			if hex_selector and hex_selector.has_method("set_selected_hex"):
 				hex_selector.set_selected_hex(world_center)
+			# Phase 1D: debug viz — red=hit, green=projected 2D on terrain, blue=chunk origin, yellow=slice center at terrain
+			if _debug_selection_viz and chunk_mgr:
+				var h_center: float = chunk_mgr.get_height_at(world_center.x, world_center.y) if chunk_mgr.has_method("get_height_at") else 0.0
+				_update_selection_debug_viz(hit_pos, cell_xz, hit_pos.y, chunk_origin, world_center, h_center)
 	else:
 		_selected_hex_center = Vector2(Constants.SELECTION_SENTINEL_NO_HEX, Constants.SELECTION_SENTINEL_NO_HEX)
 		_selected_cell_id = 0
 		_clear_zoom_in_message()
+		if _debug_selection_viz:
+			_hide_selection_debug_viz()
 		var hex_sel = get_parent().get_node_or_null("HexSelector")
 		if hex_sel and hex_sel.has_method("clear_selection"):
 			hex_sel.clear_selection()
@@ -306,6 +311,14 @@ func _handle_hex_selection_click(screen_pos: Vector2) -> void:
 # DEBUG VISUALS
 var debug_hit_sphere: MeshInstance3D = null
 var debug_center_sphere: MeshInstance3D = null
+
+## Phase 1D: Coordinate debug (F9). Red=raycast hit, Green=projected 2D (Y=0), Blue=chunk origin, Yellow=cell center at terrain.
+var _debug_selection_viz: bool = false
+var _debug_viz_pending: Dictionary = {}  # Deferred apply to avoid freeze during input
+var _debug_viz_hit: MeshInstance3D = null
+var _debug_viz_proj: MeshInstance3D = null
+var _debug_viz_chunk: MeshInstance3D = null
+var _debug_viz_center: MeshInstance3D = null
 
 func _update_debug_visuals(hit_pos: Vector3, center_pos: Vector3) -> void:
 	if not debug_hit_sphere:
@@ -336,6 +349,91 @@ func _update_debug_visuals(hit_pos: Vector3, center_pos: Vector3) -> void:
 	debug_center_sphere.global_position = center_pos
 	debug_hit_sphere.visible = true
 	debug_center_sphere.visible = true
+
+
+func _ensure_debug_viz_marker(parent: Node, name_suffix: String, color: Color, radius: float) -> MeshInstance3D:
+	var existing = parent.get_node_or_null(name_suffix)
+	if existing is MeshInstance3D:
+		return existing as MeshInstance3D
+	var mi = MeshInstance3D.new()
+	mi.name = name_suffix
+	var sphere = SphereMesh.new()
+	sphere.radius = radius
+	sphere.height = radius * 2.0
+	var mat = StandardMaterial3D.new()
+	mat.albedo_color = color
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	sphere.material = mat
+	mi.mesh = sphere
+	parent.add_child(mi)
+	return mi
+
+
+func _update_selection_debug_viz(hit_pos: Vector3, cell_xz: Vector2, proj_terrain_y: float, chunk_origin: Vector2, center: Vector2, center_terrain_y: float) -> void:
+	# Store for deferred run (avoid modifying scene tree during input → prevents freeze)
+	_debug_viz_pending = {
+		"hit_pos": hit_pos,
+		"cell_xz": cell_xz,
+		"proj_terrain_y": proj_terrain_y,
+		"chunk_origin": chunk_origin,
+		"center": center,
+		"center_terrain_y": center_terrain_y
+	}
+	call_deferred("_apply_selection_debug_viz")
+
+
+func _apply_selection_debug_viz() -> void:
+	if _debug_viz_pending.is_empty():
+		return
+	var hit_pos: Vector3 = _debug_viz_pending.hit_pos
+	var cell_xz: Vector2 = _debug_viz_pending.cell_xz
+	var proj_terrain_y: float = _debug_viz_pending.get("proj_terrain_y", 0.0)
+	var chunk_origin: Vector2 = _debug_viz_pending.chunk_origin
+	var center: Vector2 = _debug_viz_pending.center
+	var center_terrain_y: float = _debug_viz_pending.center_terrain_y
+	_debug_viz_pending = {}
+
+	# Attach to scene root (camera's parent) so markers are in the same 3D world
+	var scene_root: Node = get_parent()
+	var container: Node3D = scene_root.get_node_or_null("SelectionDebugViz") as Node3D
+	if container == null:
+		container = Node3D.new()
+		container.name = "SelectionDebugViz"
+		scene_root.add_child(container)
+	var hit_m = _ensure_debug_viz_marker(container, "Hit", Color(1, 0, 0), 25.0)
+	var proj_m = _ensure_debug_viz_marker(container, "Proj2D", Color(0, 1, 0), 20.0)
+	var chunk_m = _ensure_debug_viz_marker(container, "ChunkOrigin", Color(0.3, 0.3, 1), 15.0)
+	var center_m = _ensure_debug_viz_marker(container, "CellCenter", Color(1, 1, 0), 35.0)
+	_debug_viz_hit = hit_m
+	_debug_viz_proj = proj_m
+	_debug_viz_chunk = chunk_m
+	_debug_viz_center = center_m
+	_debug_viz_hit.global_position = hit_pos
+	# Green = projected 2D on terrain (same XZ as hit, Y = terrain at hit so it doesn't sit on Y=0 "grid")
+	_debug_viz_proj.global_position = Vector3(cell_xz.x, proj_terrain_y, cell_xz.y)
+	_debug_viz_chunk.global_position = Vector3(chunk_origin.x, 0.0, chunk_origin.y)
+	_debug_viz_center.global_position = Vector3(center.x, center_terrain_y, center.y)
+	_debug_viz_hit.visible = true
+	_debug_viz_proj.visible = true
+	_debug_viz_chunk.visible = true
+	_debug_viz_center.visible = true
+
+
+func _apply_f9_toggle() -> void:
+	_debug_selection_viz = not _debug_selection_viz
+	if not _debug_selection_viz:
+		_hide_selection_debug_viz()
+	if OS.is_debug_build():
+		print("[Camera] Selection coordinate debug viz: %s (F9 to toggle)" % ("ON" if _debug_selection_viz else "OFF"))
+
+
+func _hide_selection_debug_viz() -> void:
+	var scene_root: Node = get_parent()
+	var container = scene_root.get_node_or_null("SelectionDebugViz") as Node3D
+	if container:
+		for c in container.get_children():
+			if c is MeshInstance3D:
+				(c as MeshInstance3D).visible = false
 
 
 var _selected_hex_center: Vector2 = Vector2(Constants.SELECTION_SENTINEL_NO_HEX, Constants.SELECTION_SENTINEL_NO_HEX)
@@ -781,8 +879,36 @@ func _update_hex_grid_interaction() -> void:
 		else:
 			_f7_pressed_last_frame = false
 
+		# F12: Phase 1D automated selection offset test (20 samples, metadata vs analytical). F8 reserved by debugger.
+		if Input.is_key_pressed(KEY_F12):
+			if not _f12_pressed_last_frame and OS.is_debug_build():
+				var chunk_mgr = get_parent().get_node_or_null("ChunkManager")
+				if chunk_mgr and chunk_mgr.has_method("run_selection_offset_test"):
+					var result = chunk_mgr.run_selection_offset_test(20)
+					print("\n=== SELECTION OFFSET TEST (Phase 1D) ===")
+					print("Samples: %d" % result.get("n", 0))
+					print("Min offset (m): %.3f" % result.get("min_offset", -1.0))
+					print("Max offset (m): %.3f" % result.get("max_offset", -1.0))
+					print("Mean offset (m): %.3f" % result.get("mean_offset", -1.0))
+					print("Std deviation (m): %.3f" % result.get("std_offset", -1.0))
+					print("PASS: %s (max < 10m, std < 5m)" % result.get("pass", false))
+					print("=========================================\n")
+				_f12_pressed_last_frame = true
+		else:
+			_f12_pressed_last_frame = false
+
+		# F9: Phase 1D coordinate debug (red=hit, green=proj 2D, blue=chunk origin, yellow=cell center at terrain). Defer so no scene tree access in key frame.
+		if Input.is_key_pressed(KEY_F9):
+			if not _f9_pressed_last_frame and OS.is_debug_build():
+				_f9_pressed_last_frame = true
+				call_deferred("_apply_f9_toggle")
+		else:
+			_f9_pressed_last_frame = false
+
 
 var _grid_visible: bool = Constants.GRID_DEFAULT_VISIBLE
+var _f12_pressed_last_frame: bool = false
+var _f9_pressed_last_frame: bool = false
 var _f1_pressed_last_frame: bool = false
 var _f2_pressed_last_frame: bool = false
 var _f3_pressed_last_frame: bool = false

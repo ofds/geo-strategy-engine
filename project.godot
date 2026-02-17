@@ -14,3 +14,7 @@ config/name="GeoStrategy"
 run/main_scene="res://scenes/terrain_demo.tscn"
 config/features=PackedStringArray("4.5", "Forward Plus")
 config/icon="res://icon.svg"
+
+[autoload]
+
+VoronoiBatchRunner="*res://autoload/voronoi_batch_runner.gd"

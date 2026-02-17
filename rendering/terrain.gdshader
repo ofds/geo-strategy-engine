@@ -28,6 +28,10 @@ uniform vec3 hex_line_color = vec3(0.08, 0.10, 0.06);
 uniform bool show_hex_grid = true;
 // Per-chunk cell ID texture (RGBA → 32-bit id). Phase 1B fix: texelFetch for exact texel sampling.
 uniform sampler2D cell_id_texture : filter_nearest, repeat_disable, hint_default_black;
+// Phase 2A: Boundary distance field (grayscale 0–1 = 0–500 m). Shape-agnostic (hex now, Voronoi/merged later).
+uniform sampler2D boundary_distance_texture : hint_default_white, filter_linear, repeat_disable;
+uniform bool has_distance_field = false;
+uniform float grid_line_width_m = 3.0;  // Line width in meters; tunable without regenerating textures.
 instance uniform vec2 chunk_origin_xz = vec2(0.0, 0.0);
 
 // Optional: set true to visualize UV→pixel mapping (red=X, green=Y). Use for Test 1 verification.
@@ -108,7 +112,8 @@ void fragment() {
 		if (tex_size.x <= 1 || tex_size.y <= 1) {
 			out_albedo = vec3(1.0, 0.0, 0.0); // RED = texture not bound
 		} else {
-			ivec2 pixel_coord = ivec2(floor(v_uv * vec2(tex_size - ivec2(1, 1)) + vec2(0.5, 0.5)));
+			// Phase 1E: pixel-extent convention — pixel i owns [i/tex_size, (i+1)/tex_size)
+			ivec2 pixel_coord = ivec2(floor(v_uv * vec2(tex_size)));
 			pixel_coord = clamp(pixel_coord, ivec2(0, 0), tex_size - ivec2(1, 1));
 			vec4 cell_rgba = texelFetch(cell_id_texture, pixel_coord, 0);
 			uint cell_id = decode_cell_id(cell_rgba);
@@ -165,47 +170,50 @@ void fragment() {
 	float fog_factor = smoothstep(fog_start, fog_end_actual, dist);
 	base_col = mix(base_col, fog_color, fog_factor);
 
-	// Hex grid: texelFetch-based cell boundaries (Phase 1B fix). Exact texel sampling, 511-based convention.
+	// Hex grid: Phase 2A distance field (primary) or Phase 1F 8-direction fallback.
+	// Distance field: shape-agnostic; works for hex (now), Voronoi/merged (future). Visual params = uniforms only.
 	float grid_mix = 0.0;
 	if (show_hex_grid) {
 		ivec2 tex_size = textureSize(cell_id_texture, 0);
-		// Skip grid when texture is missing or 1x1 (avoids undefined clamp; no boundaries to draw)
 		if (tex_size.x > 1 && tex_size.y > 1) {
-			// Map UV (0..1) to integer pixel index (0..tex_size-1) matching Python: local_x = (i/(res-1))*chunk_size
-			ivec2 pixel_coord = ivec2(floor(v_uv * vec2(tex_size - ivec2(1, 1)) + vec2(0.5, 0.5)));
+			ivec2 pixel_coord = ivec2(floor(v_uv * vec2(tex_size)));
+			pixel_coord = clamp(pixel_coord, ivec2(0, 0), tex_size - ivec2(1, 1));
 
-			// Debug: visualize pixel coordinate (Test 1 — gradient: NW=black, SE=yellow)
 			if (show_debug_texel_coords) {
 				vec2 debug_coord = vec2(pixel_coord) / max(vec2(float(tex_size.x - 1), float(tex_size.y - 1)), vec2(1.0, 1.0));
 				base_col = vec3(debug_coord.x, debug_coord.y, 0.0);
 				grid_mix = 0.0;
+			} else if (has_distance_field) {
+				// Distance field: sample grayscale (0–1 = 0–500 m), draw line where distance < grid_line_width_m.
+				float distance_to_boundary = texture(boundary_distance_texture, v_uv).r;
+				distance_to_boundary *= 500.0;  // Match Python normalization (DISTANCE_NORMALIZE_M)
+				float alpha = 1.0 - smoothstep(0.0, grid_line_width_m, distance_to_boundary);
+				alpha *= smoothstep(0.35, 0.65, dot(n, vec3(0.0, 1.0, 0.0)));
+				grid_mix = min(alpha * hex_grid_strength, 1.0);
+				base_col = mix(base_col, base_col * 0.5, grid_mix);
+				base_col = mix(base_col, hex_line_color, grid_mix * 0.85);
 			} else {
-
-			// Sample center and four neighbors with texelFetch (exact texel, no filtering)
-			vec4 cell_rgba = texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord, tex_size), 0);
-			uint cell_id = decode_cell_id(cell_rgba);
-			uint id_north = decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(0, 1), tex_size), 0));
-			uint id_south = decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(0, -1), tex_size), 0));
-			uint id_east = decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(1, 0), tex_size), 0));
-			uint id_west = decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(-1, 0), tex_size), 0));
-			bool on_boundary = (id_north != cell_id) || (id_south != cell_id) || (id_east != cell_id) || (id_west != cell_id);
-
-			// Disable boundary at texture edges (chunk boundary artifact mitigation)
-			float max_side = max(float(tex_size.x), float(tex_size.y));
-			float edge_threshold = (max_side > 0.0) ? (1.5 / max_side) : 0.01;
-			bool near_edge = (v_uv.x < edge_threshold || v_uv.x > 1.0 - edge_threshold || v_uv.y < edge_threshold || v_uv.y > 1.0 - edge_threshold);
-			if (near_edge) {
-				on_boundary = false;
-			}
-			float line_mask = on_boundary ? 1.0 : 0.0;
-
-			// Fade on steep slopes
-			line_mask *= smoothstep(0.35, 0.65, dot(n, vec3(0.0, 1.0, 0.0)));
-
-			grid_mix = min(line_mask * hex_grid_strength, 1.0);
-			// Darken and draw line; use stronger contrast on light terrain so grid is visible on snow
-			base_col = mix(base_col, base_col * 0.5, grid_mix);
-			base_col = mix(base_col, hex_line_color, grid_mix * 0.85);
+				// Fallback: 8-direction neighbor sampling (chunks without distance field, e.g. LOD 3+).
+				uint cell_id = decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord, tex_size), 0));
+				float boundary_strength = 0.0;
+				if (decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(0, -1), tex_size), 0)) != cell_id) { boundary_strength += 1.0; }
+				if (decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(1, -1), tex_size), 0)) != cell_id) { boundary_strength += 0.707; }
+				if (decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(1, 0), tex_size), 0)) != cell_id) { boundary_strength += 1.0; }
+				if (decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(1, 1), tex_size), 0)) != cell_id) { boundary_strength += 0.707; }
+				if (decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(0, 1), tex_size), 0)) != cell_id) { boundary_strength += 1.0; }
+				if (decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(-1, 1), tex_size), 0)) != cell_id) { boundary_strength += 0.707; }
+				if (decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(-1, 0), tex_size), 0)) != cell_id) { boundary_strength += 1.0; }
+				if (decode_cell_id(texelFetch(cell_id_texture, clamp_texel_coord(pixel_coord + ivec2(-1, -1), tex_size), 0)) != cell_id) { boundary_strength += 0.707; }
+				boundary_strength = clamp(boundary_strength, 0.0, 1.0);
+				float max_side = max(float(tex_size.x), float(tex_size.y));
+				float edge_threshold = (max_side > 0.0) ? (0.5 / max_side) : 0.001;
+				bool near_edge = (v_uv.x < edge_threshold || v_uv.x > 1.0 - edge_threshold || v_uv.y < edge_threshold || v_uv.y > 1.0 - edge_threshold);
+				if (near_edge) { boundary_strength = 0.0; }
+				float line_mask = boundary_strength;
+				line_mask *= smoothstep(0.35, 0.65, dot(n, vec3(0.0, 1.0, 0.0)));
+				grid_mix = min(line_mask * hex_grid_strength, 1.0);
+				base_col = mix(base_col, base_col * 0.5, grid_mix);
+				base_col = mix(base_col, hex_line_color, grid_mix * 0.85);
 			}
 		}
 	}
